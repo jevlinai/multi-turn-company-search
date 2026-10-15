@@ -20,3 +20,7 @@ runs/
 *.swp
 .idea/
 .vscode/
+
+# Benchmark fork: the converted public dataset is rebuilt by scripts/jevlin_bench/build_public_dataset.py
+# and pinned by experiments/FROZEN.sha256; the files themselves are not committed.
+datasets/
