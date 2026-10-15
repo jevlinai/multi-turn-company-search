@@ -182,6 +182,31 @@ for _core in (False, True):
          **({"knowledge": "core"} if _core else {})}, fetch_unit_cost_usd=0.001,
     )
 
+# Jevlin arms (benchmark fork; see jevlin_vendor.py and scripts/jevlin_core/). Search-only: no
+# native fetch, and the neutral custom fetcher is deliberately not wired, so these vendors cannot
+# be planned on the search_and_fetch board. search_unit_cost_usd is None because the cost is
+# observed from the gateway's usage.cost_micros on every call, never assumed from a rate card.
+_JEVLIN_ARMS = (
+    ("jevlin_fast", "Jevlin fast", "POST /v1/search tier=fast view=merged", ("JEVLIN_API_KEY",),
+     {"tier": "fast", "providers": "account default", "view": "merged", "presentation": "merged"}),
+    ("jevlin_balanced", "Jevlin balanced", "POST /v1/search tier=balanced view=merged", ("JEVLIN_API_KEY",),
+     {"tier": "balanced", "providers": "account default", "view": "merged", "presentation": "merged"}),
+    ("jevlin_single", "Jevlin single provider", "POST /v1/search providers=[one] view=merged", ("JEVLIN_API_KEY",),
+     {"tier": None, "providers": "JEVLIN_SINGLE_PROVIDER (default exa)", "view": "merged", "presentation": "raw"}),
+    ("jevlin_fanout_raw", "Jevlin fan-out, raw", "POST /v1/search tier=balanced providers=pinned view=merged",
+     ("JEVLIN_API_KEY", "JEVLIN_PROVIDERS"),
+     {"tier": "balanced", "providers": "JEVLIN_PROVIDERS (pinned)", "view": "merged", "presentation": "raw"}),
+    ("jevlin_fanout_merged", "Jevlin fan-out, merged", "POST /v1/search tier=balanced providers=pinned view=merged",
+     ("JEVLIN_API_KEY", "JEVLIN_PROVIDERS"),
+     {"tier": "balanced", "providers": "JEVLIN_PROVIDERS (pinned)", "view": "merged", "presentation": "merged"}),
+    ("jevlin_cli", "Jevlin CLI (released client)", "jevlin search -config <bench> --stdin -no-flush",
+     ("JEVLIN_API_KEY", "JEVLIN_BIN", "JEVLIN_CLI_CONFIG"),
+     {"client": "jevlin 0.2.0 release binary", "tier": "account default", "view": None, "presentation": "client merge"}),
+)
+for _key, _name, _endpoint, _env, _config in _JEVLIN_ARMS:
+    _slug = _key.replace("_", "-")
+    VENDORS[_key] = VendorSpec(_key, _slug, _name, _slug, _endpoint, _env, None, False, None, None, _config)
+
 DEFAULT_VENDOR_KEYS = tuple(VENDORS)
 
 
@@ -346,6 +371,10 @@ def parallel_site_policy(query: str) -> tuple[str, list[str]]:
 def _parse_hits(vendor_key: str, payload: Any, max_results: int) -> list[dict[str, Any]]:
     payload = payload if isinstance(payload, dict) else {}
     hits: list[dict[str, Any]] = []
+    if vendor_key.startswith("jevlin_"):
+        from . import jevlin_vendor  # local import: jevlin_vendor builds on this module
+
+        return jevlin_vendor.parse_hits(vendor_key, payload, max_results)
     if vendor_key.startswith("nimble_"):
         return _dedupe([_hit(h["url"], h["title"], h["snippet"]) for h in nimble.search_hits(payload, max_results)], max_results)
     if vendor_key.startswith("parallel_"):
@@ -411,6 +440,12 @@ def search(
     search_context_size: str | None = None,
 ) -> VendorCall:
     spec = VENDORS[vendor_key]
+    if vendor_key.startswith("jevlin_"):
+        from . import jevlin_vendor  # local import: jevlin_vendor builds on this module
+
+        # Returns a complete call: hits in the shared shape and cost_usd observed from the gateway
+        # (micros → dollars), which the dollar-cost helper below does not read.
+        return jevlin_vendor.search_call(vendor_key, query, max_results=max_results)
     if vendor_key.startswith("nimble_"):
         call = _request(
             method="POST", url=nimble.SEARCH_URL,

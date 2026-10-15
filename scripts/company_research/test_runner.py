@@ -185,9 +185,17 @@ class RunnerTest(unittest.TestCase):
                 "linkup_standard", "parallel_advanced", "parallel_basic",
                 "parallel_fast", "parallel_turbo", "seltz_companies", "serp",
                 "tavily_advanced", "tavily_basic", "you_highlights", "you_highlights_core", "tinyfish", "perplexity",
+                # benchmark fork: Jevlin arms, search-only (no fetch path by design)
+                "jevlin_fast", "jevlin_balanced", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli",
             },
         )
         capabilities = {row["vendor"]: row for row in capability_inventory()}
+        jevlin = {key for key in capabilities if key.startswith("jevlin_")}
+        for key in jevlin:
+            self.assertFalse(capabilities[key]["native_fetch"])
+            self.assertFalse(capabilities[key]["custom_fetch"])
+            self.assertFalse(capabilities[key]["fetch_available"])
+        capabilities = {key: row for key, row in capabilities.items() if key not in jevlin}
         for key in (
             "exa_deep", "exa_instant", "firecrawl", "linkup_fast",
             "linkup_standard", "parallel_advanced", "parallel_basic",
@@ -226,6 +234,13 @@ class RunnerTest(unittest.TestCase):
         fixtures["you_highlights_core"] = fixtures["you_highlights"]
         fixtures["nimble_lite"] = {"results": [{"url": "https://a.test", "title": "A", "description": "one"}]}
         fixtures["nimble_standard"] = fixtures["nimble_lite"]
+        merged = {"merged": [{"url": "https://a.test", "title": "A", "excerpt": "one"}]}
+        raw = {"candidates": [{"provider": "exa", "status": "ok", "citations": [{"url": "https://a.test", "title": "A", "snippet": "one"}]}]}
+        fixtures.update({
+            "jevlin_fast": merged, "jevlin_balanced": merged, "jevlin_fanout_merged": merged,
+            "jevlin_single": raw, "jevlin_fanout_raw": raw,
+            "jevlin_cli": {"ok": True, "result": {"merged": [{"url": "https://a.test", "title": "A", "snippet": "one"}]}},
+        })
         self.assertEqual(set(fixtures), set(VENDORS))
         for vendor, payload in fixtures.items():
             with self.subTest(vendor=vendor):

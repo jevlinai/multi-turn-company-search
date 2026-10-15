@@ -54,6 +54,11 @@ class RunnerConfig:
             raise ValueError("search_only mode requires max_fetches=0")
         if self.research_mode == "search_and_fetch" and self.agent.max_fetches <= 0:
             raise ValueError("search_and_fetch mode requires max_fetches > 0")
+        if self.research_mode == "search_and_fetch":
+            # A vendor with no fetch path would silently run search-only under the fetch label.
+            search_only = [key for key in self.vendor_keys if not (VENDORS[key].native_fetch or VENDORS[key].custom_fetch)]
+            if search_only:
+                raise ValueError(f"search_and_fetch mode needs a fetch path; search-only vendors: {search_only}")
         self.agent.validate()
 
 
