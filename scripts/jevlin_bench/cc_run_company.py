@@ -543,7 +543,13 @@ def run_job(case: dict[str, Any], arm: str, trial_index: int, *, args, dataset: 
 
 
 def judged_on_nothing(row: dict[str, Any]) -> bool:
-    """A job whose every search failed (a gateway storm) was judged on nothing: not done."""
+    """A job with no successful search was judged on nothing: not done. That is every search failing
+    (a gateway storm) and also no search being made at all (a refused command — the pre-fix
+    dollar-sign rows of the 2026-10-16 pilot, which the first rule kept on resume and so froze the
+    error in place). The harness marks both as errors, so an `ok` row always has a search behind it."""
+    succ = row.get("successful_searches")
+    if succ is not None:
+        return int(succ or 0) == 0 and row.get("status") != "ok"
     return int(row.get("search_count") or 0) > 0 and int(row.get("failed_searches") or 0) == int(row.get("search_count") or 0)
 
 

@@ -465,5 +465,19 @@ class JobOrder(unittest.TestCase):
         self.assertEqual(jobs, expected)
 
 
+class ResumeRule(unittest.TestCase):
+    def test_no_successful_search_is_judged_on_nothing_whether_searches_failed_or_were_never_made(self):
+        storm = {"status": "error", "search_count": 3, "successful_searches": 0, "failed_searches": 3}
+        refused = {"status": "error", "result_error": "RuntimeError: model returned without a successful vendor web search",
+                   "search_count": 0, "successful_searches": 0, "failed_searches": 0}
+        judged = {"status": "ok", "search_count": 5, "successful_searches": 4, "failed_searches": 1}
+        self.assertTrue(cc.judged_on_nothing(storm))
+        self.assertTrue(cc.judged_on_nothing(refused), "zero searches made: the row must re-run on resume")
+        self.assertFalse(cc.judged_on_nothing(judged))
+        # rows written before successful_searches existed fall back to the all-failed rule
+        self.assertTrue(cc.judged_on_nothing({"status": "error", "search_count": 2, "failed_searches": 2}))
+        self.assertFalse(cc.judged_on_nothing({"status": "error", "search_count": 0, "failed_searches": 0}))
+
+
 if __name__ == "__main__":
     unittest.main()
