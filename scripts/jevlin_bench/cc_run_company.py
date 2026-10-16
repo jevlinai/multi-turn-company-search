@@ -76,6 +76,8 @@ SYSTEM_PROMPT = """You are a company research agent. Identify companies that sat
 constraints in the user's question. Your only research tool is the shell command
 `{command} "<query>"`, run with Bash exactly as written (full path, one quoted argument). It searches through the benchmark vendor and returns JSON: {{"vendor", "query", "hits": [{{"url", "title", "snippet", "metadata"}}], "error"}}. Use it to form focused research queries for missing evidence. There is no page-fetch tool and no other tool: do not run any other command, and do not read, write or fetch anything. You may call the search command at most {max_searches} times in total; after that it answers "search budget exhausted; answer now". The reference protocol allows at most two searches per turn over at most eight turns; keep to that pace.
 
+Write queries in plain words only. A query must not contain the characters $ ` \\ | ; & < > ( ) ! or quotes: the command is refused before it runs and the search is lost. Write money as "USD 100 million" or "100 million dollars", never "$100 million". If a search command is refused, rewrite the query without those characters and call it again.
+
 Do not use prior knowledge as evidence. Do not include a company unless the
 collected evidence supports every constraint. Prefer precision over padding.
 Return each company once under its canonical public name, include its canonical
