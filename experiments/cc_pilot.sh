@@ -2,6 +2,9 @@
 # Claude Code agent, pilot: every question of the frozen set, every arm, PASSES passes. Pass N writes
 # trial N with seed N, so the three trials the judge expects are three separate passes — run a cache
 # TTL (15 min) apart at least, never concurrently, so Jevlin's cache cannot answer trial 2 for free.
+# Within a pass the jobs run in arm blocks ordered by gateway cache key class (ORDER=key-class), with
+# a CACHE_GAP_MIN wait before each new balanced-tier block, so no arm's search is answered from a
+# cache another arm filled (the smoke saw 7 of 112 such hits under the plain shuffle).
 # Bills the Claude subscription; a spent usage window is waited out and retried by the driver.
 # Rerunning resumes an interrupted pass (rows judged on something are kept; the rest re-run).
 # Not official OpenBenchmarks scoring: public rows, a different agent; scores are not comparable to the board.
@@ -16,7 +19,9 @@ PY="${PYTHON:-}"
 : "${PASSES:=3}"
 : "${OUT_DIR:=runs/cc-pilot}"
 : "${RATE_LIMIT_WAIT:=1200}"
-: "${PASS_GAP_S:=900}"   # at least the gateway cache TTL between passes
+: "${PASS_GAP_S:=960}"   # above the gateway cache TTL between passes
+: "${ORDER:=key-class}"  # or shuffle (the smoke's order)
+: "${CACHE_GAP_MIN:=16}"
 mkdir -p "$OUT_DIR"
 
 "$PY" experiments/catalog_freeze.py verify
@@ -29,9 +34,10 @@ for pass in $(seq 1 "$PASSES"); do
     cp "$SUMMARY" "$OUT_DIR/cc-pass-$pass.before-resume-$(date -u +%Y%m%dT%H%M%SZ).json"
     RESUME=(--resume-from "$SUMMARY")
   fi
-  echo "== pass $pass / $PASSES  trial=$pass seed=$pass model=$MODEL arms=$ARMS ${RESUME:+(resuming)}"
+  echo "== pass $pass / $PASSES  trial=$pass seed=$pass model=$MODEL arms=$ARMS order=$ORDER ${RESUME:+(resuming)}"
   if ! PYTHONPATH=scripts "$PY" scripts/jevlin_bench/cc_run_company.py \
       --dataset "$DATASET" --arms "$ARMS" --model "$MODEL" --trial-index "$pass" --seed "$pass" \
+      --order "$ORDER" --cache-gap-min "$CACHE_GAP_MIN" \
       --rate-limit-wait "$RATE_LIMIT_WAIT" --abort-after-run-errors 5 --abort-after-hop-errors 12 \
       ${RESUME[@]+"${RESUME[@]}"} --out-dir "$OUT_DIR" --summary "$SUMMARY"; then
     echo "pass $pass aborted; stopping. Rerun cc_pilot.sh to resume."

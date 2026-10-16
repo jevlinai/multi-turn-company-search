@@ -426,5 +426,44 @@ class unittest_env:
         return False
 
 
+class JobOrder(unittest.TestCase):
+    ARMS = ["perplexity", "exa_instant", "parallel_fast", "jevlin_fast", "jevlin_balanced", "jevlin_single",
+            "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"]
+    CASES = [{"case_key": f"c{i}"} for i in range(4)]
+
+    def test_cache_key_classes(self):
+        self.assertEqual(cc.cache_key_class("jevlin_fast"), "fast")
+        self.assertEqual(cc.cache_key_class("jevlin_single"), "single")
+        for arm in ("jevlin_balanced", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"):
+            self.assertEqual(cc.cache_key_class(arm), "balanced")
+        self.assertEqual(cc.cache_key_class("exa_instant"), "direct:exa_instant")
+
+    def test_key_class_order_runs_arm_blocks_with_balanced_tier_arms_apart(self):
+        jobs, blocks = cc.plan_jobs(self.CASES, self.ARMS, seed=1, trial_index=1, order="key-class")
+        self.assertEqual(len(jobs), 36)
+        seq = [arm for _, arm in jobs]
+        self.assertEqual([a for i, a in enumerate(seq) if i == 0 or seq[i - 1] != a], blocks, "each arm is one contiguous block")
+        self.assertEqual(sorted(blocks), sorted(self.ARMS))
+        balanced_positions = [i for i, a in enumerate(blocks) if cc.cache_key_class(a) == "balanced"]
+        self.assertTrue(all(b - a >= 2 for a, b in zip(balanced_positions, balanced_positions[1:])), blocks)
+        # Every (question, arm) pair exactly once, the same set the shuffle order produces.
+        shuffled, _ = cc.plan_jobs(self.CASES, self.ARMS, seed=7, trial_index=1, order="shuffle")
+        self.assertEqual(sorted((c["case_key"], a) for c, a in shuffled), sorted((c["case_key"], a) for c, a in jobs))
+
+    def test_block_order_rotates_by_trial_and_shuffle_is_unchanged(self):
+        b1 = cc.block_order(self.ARMS, 1)
+        b2 = cc.block_order(self.ARMS, 2)
+        self.assertNotEqual(b1, b2)
+        self.assertEqual(sorted(b1), sorted(b2))
+        self.assertEqual(cc.block_order(["exa_instant", "jevlin_balanced"], 1), ["jevlin_balanced", "exa_instant"])
+        self.assertEqual(cc.block_order(["exa_instant", "perplexity"], 3), ["exa_instant", "perplexity"])
+        jobs, blocks = cc.plan_jobs(self.CASES, self.ARMS, seed=7, trial_index=1, order="shuffle")
+        self.assertEqual(blocks, self.ARMS)
+        expected = [(c, a) for c in self.CASES for a in self.ARMS]
+        import random
+        random.Random(7).shuffle(expected)
+        self.assertEqual(jobs, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

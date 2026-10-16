@@ -575,6 +575,67 @@ def select_cases(dataset: dict[str, Any], *, case_keys: list[str], offset: int, 
     return selected
 
 
+# Gateway cache key classes. The cache is keyed by query + tier + provider set + filters, so every
+# arm that asks for tier balanced with the account's (pinned) provider set — jevlin_balanced, both
+# fan-out arms and the CLI's default config — shares one key class; `fast` and `single` are their own;
+# direct vendors have no shared cache. The smoke on 2026-10-16 saw 7 of 112 searches answered from
+# cache between balanced-tier arms of the same question (the agent wrote the same first query), so a
+# pass can be ordered by key class with a TTL wait before every new balanced-tier block.
+SHARED_KEY_CLASSES = ("balanced", "fast", "single")
+
+
+def cache_key_class(arm: str) -> str:
+    if arm == "jevlin_fast":
+        return "fast"
+    if arm == "jevlin_single":
+        return "single"
+    if arm.startswith("jevlin"):
+        return "balanced"
+    return f"direct:{arm}"
+
+
+def block_order(arms: list[str], trial_index: int) -> list[str]:
+    """Arm blocks with the balanced-tier arms spread as far apart as the others allow; rotated by
+    trial so no arm always runs first or last."""
+    balanced = [a for a in arms if cache_key_class(a) == "balanced"]
+    others = [a for a in arms if cache_key_class(a) != "balanced"]
+    if balanced:
+        r = (trial_index - 1) % len(balanced)
+        balanced = balanced[r:] + balanced[:r]
+    if others:
+        r = (trial_index - 1) % len(others)
+        others = others[r:] + others[:r]
+    if len(balanced) <= 1:
+        return balanced + others
+    gaps = len(balanced) - 1
+    per, extra = divmod(len(others), gaps)
+    out, i = [balanced[0]], 0
+    for g in range(gaps):
+        n = per + (1 if g < extra else 0)
+        out += others[i:i + n]
+        i += n
+        out.append(balanced[g + 1])
+    return out + others[i:]
+
+
+def plan_jobs(cases: list[dict[str, Any]], arms: list[str], *, seed: int | None, trial_index: int, order: str) -> tuple[list[tuple[dict[str, Any], str]], list[str]]:
+    """`shuffle`: every (question, arm) pair in one seeded shuffle (the original order). `key-class`:
+    one block per arm in `block_order`, questions shuffled by seed within each block."""
+    if order == "shuffle":
+        jobs = [(case, arm) for case in cases for arm in arms]
+        if seed is not None:
+            random.Random(seed).shuffle(jobs)
+        return jobs, list(arms)
+    blocks = block_order(arms, trial_index)
+    jobs = []
+    for arm in blocks:
+        ordered = list(cases)
+        if seed is not None:
+            random.Random(f"{seed}:{arm}").shuffle(ordered)
+        jobs += [(case, arm) for case in ordered]
+    return jobs, blocks
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", type=Path, required=True, help="company-research-dataset-v1 JSON (validated and content-addressed on load)")
@@ -584,6 +645,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--query-limit", type=int, default=None)
     parser.add_argument("--trial-index", type=int, default=1, help="the trial this pass writes (1..N); one pass per trial")
     parser.add_argument("--seed", type=int, default=None, help="shuffle the (question, arm) order with this seed")
+    parser.add_argument("--order", choices=("shuffle", "key-class"), default="shuffle",
+                        help="shuffle: one seeded shuffle of every (question, arm) pair; key-class: one block per arm, balanced-tier arms spread "
+                             "apart and a --cache-gap-min wait before each new block of a shared gateway cache key class")
+    parser.add_argument("--cache-gap-min", type=float, default=16.0, help="key-class order: minutes since the previous block of the same key class ended")
     parser.add_argument("--out-dir", type=Path, required=True, help="runs root; artifacts at <out-dir>/<slug>/search_only/<arm>/<case>/trial-<n>.json")
     parser.add_argument("--summary", type=Path, default=None, help="pass summary JSON; default <out-dir>/cc-pass-<trial>.json")
     parser.add_argument("--jobs-dir", type=Path, default=None, help="per-job work dirs (wrapper, hops, claude output); default <out-dir>/jobs")
@@ -626,14 +691,15 @@ def main(argv: list[str] | None = None) -> int:
         print("warning: jevlin_fixture without --fixture: every search of that arm will fail (a storm stand-in)", flush=True)
     case_keys = [k.strip() for k in args.cases.split(",") if k.strip()]
     cases = select_cases(dataset, case_keys=case_keys, offset=args.query_offset, limit=args.query_limit)
-    jobs = [(case, arm) for case in cases for arm in arms]
-    if args.seed is not None:
-        random.Random(args.seed).shuffle(jobs)
+    jobs, blocks = plan_jobs(cases, arms, seed=args.seed, trial_index=args.trial_index, order=args.order)
+    args.block_order = blocks
     env_needed = required_env([a for a in arms if a in VENDORS])
     if args.plan_only:
         print(json.dumps({
             "mode": "plan-only", "dataset_slug": summary_info.dataset_slug, "dataset_sha256": summary_info.content_sha256,
             "trial_index": args.trial_index, "seed": args.seed, "arms": arms, "question_count": len(cases), "planned_jobs": len(jobs),
+            "order": args.order, "block_order": blocks if args.order == "key-class" else None,
+            "cache_gap_min": args.cache_gap_min if args.order == "key-class" else None,
             "model": args.model, "effort": args.effort or None, "json_schema": args.json_schema,
             "max_searches": args.max_searches, "max_results": args.max_results, "concurrency": 1,
             "required_env_for_the_wrapper": env_needed, "out_dir": str(args.out_dir), "summary": str(args.summary),
@@ -648,7 +714,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"resume: keeping {len(resumed_rows)} rows from {args.resume_from} ({dropped} dropped: run error, missing artifact or every search failed); "
               f"{before - len(jobs)} jobs skipped, {len(jobs)} to run", flush=True)
     print(f"agent=claude-code version={version} model={args.model} effort={args.effort or '-'} json_schema={args.json_schema} "
-          f"dataset={summary_info.dataset_slug} {summary_info.content_sha256[:19]} arms={arms} trial={args.trial_index} n={len(jobs)} seed={args.seed}", flush=True)
+          f"dataset={summary_info.dataset_slug} {summary_info.content_sha256[:19]} arms={arms} trial={args.trial_index} n={len(jobs)} seed={args.seed} "
+          f"order={args.order}" + (f" blocks={blocks} cache_gap_min={args.cache_gap_min}" if args.order == "key-class" else ""), flush=True)
 
     rows: list[dict[str, Any]] = list(resumed_rows)
     aborted = False
@@ -657,10 +724,22 @@ def main(argv: list[str] | None = None) -> int:
     # and one account; each direct vendor is its own), so a gateway refusing every call is noticed
     # even though direct-vendor jobs between them keep succeeding.
     hop_errors_in_a_row: dict[str, int] = {}
+    # key-class order: the arm and end time of the last job in each shared cache key class, so a new
+    # block of the same class starts only after the gateway TTL has passed since the previous one.
+    last_in_class: dict[str, tuple[str, datetime]] = {}
+    cache_waits_s = 0.0
     started = datetime.now(timezone.utc)
     planned = len(jobs) + len(resumed_rows)
     for case, arm in jobs:
+        klass = cache_key_class(arm)
+        if args.order == "key-class" and klass in SHARED_KEY_CLASSES and klass in last_in_class and last_in_class[klass][0] != arm:
+            wait_s = args.cache_gap_min * 60 - (datetime.now(timezone.utc) - last_in_class[klass][1]).total_seconds()
+            if wait_s > 0:
+                print(f"== waiting {wait_s / 60:.1f} min before the {arm} block: '{klass}' cache key class, last used by {last_in_class[klass][0]}", flush=True)
+                time.sleep(wait_s)
+                cache_waits_s += wait_s
         _, row = run_job(case, arm, args.trial_index, args=args, dataset=dataset, jobs_dir=args.jobs_dir, version=version, fixture=args.fixture)
+        last_in_class[klass] = (arm, datetime.now(timezone.utc))
         rows.append(row)
         print(f"{row['case_key']} {arm} trial={args.trial_index} {row['status']} f1={row['f1']:.2f} p={row['precision']:.2f} r={row['recall']:.2f} "
               f"searches={row['search_count']}" + (f" ({row['failed_searches']} failed)" if row['failed_searches'] else "") +
@@ -680,7 +759,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ABORTING PASS: {hop_errors_in_a_row[family]} consecutive failed searches on {family}", flush=True)
             aborted = True
             break
+        args.cache_waits_s = cache_waits_s
         _write_summary(args, rows, arms, version, summary_info, aborted=False, partial=True, started=started, planned=planned)
+    args.cache_waits_s = cache_waits_s
     _write_summary(args, rows, arms, version, summary_info, aborted=aborted, partial=False, started=started, planned=planned)
     ok = sum(1 for r in rows if r["status"] == "ok")
     mean_f1 = sum(r["f1"] for r in rows) / len(rows) if rows else 0.0
@@ -707,6 +788,10 @@ def _write_summary(args, rows, arms, version, summary_info, *, aborted, partial,
         "research_mode": RESEARCH_MODE,
         "trial_index": args.trial_index,
         "shuffle_seed": args.seed,
+        "order": args.order,
+        "block_order": getattr(args, "block_order", None) if args.order == "key-class" else None,
+        "cache_gap_min": args.cache_gap_min if args.order == "key-class" else None,
+        "cache_waits_s": round(getattr(args, "cache_waits_s", 0.0), 1),
         "arms": list(arms),
         "model": args.model,
         "agent": {"kind": "claude-code", "version": version, "effort": args.effort or None, "json_schema": args.json_schema,
