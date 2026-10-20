@@ -524,13 +524,17 @@ class FormsPreflight(unittest.TestCase):
             argv = ["--dataset", str(dataset), "--arms", "jevlin_balanced,jevlin_balanced_forms", "--out-dir", str(Path(tmp) / "out"),
                     "--claude-bin", "/nonexistent/claude"]
             out = io.StringIO()
-            with mock.patch.object(forms_preflight, "probe", return_value=(False, "HTTP 400: malformed_json")), \
+            # The suite never reaches the router: on a checkout with a .env, an unpatched probe would
+            # make a live, billed request and pass or fail on what the router answered.
+            no_network = mock.patch("company_research.vendors._request", side_effect=AssertionError("the test suite must not reach the router"))
+            with no_network, mock.patch.object(forms_preflight, "probe", return_value=(False, "HTTP 400: malformed_json")), \
                     mock.patch.object(cc, "run_job", side_effect=AssertionError("no session may start")), contextlib.redirect_stdout(out):
                 self.assertEqual(cc.main(argv), 2)
             self.assertIn("PR #55", out.getvalue())
             self.assertFalse((Path(tmp) / "out" / "cc-pass-1.json").exists())
             # plan-only never probes (no spend)
-            with mock.patch.object(forms_preflight, "probe", side_effect=AssertionError("no probe")), contextlib.redirect_stdout(io.StringIO()):
+            with no_network, mock.patch.object(forms_preflight, "probe", side_effect=AssertionError("no probe")), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cc.main([*argv, "--plan-only"]), 0)
 
 

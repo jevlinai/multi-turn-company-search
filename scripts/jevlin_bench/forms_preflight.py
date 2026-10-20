@@ -61,11 +61,16 @@ def probe() -> tuple[bool, str]:
     return True, "accepted: 200 with coverage.by_form"
 
 
-def require_forms_router(arms: list[str], probe_fn=probe) -> str | None:
-    """None when no arm needs forms or the router accepts them; otherwise the refusal message."""
+def require_forms_router(arms: list[str], probe_fn=None) -> str | None:
+    """None when no arm needs forms or the router accepts them; otherwise the refusal message.
+
+    `probe` is looked up when this runs, not bound as a default when the module loads: a default of
+    `probe` would keep the real function, so a test that patches `forms_preflight.probe` would still
+    make a live, billed request.
+    """
     if not any(core.is_forms_arm(arm) for arm in arms):
         return None
-    accepted, detail = probe_fn()
+    accepted, detail = (probe_fn or probe)()
     if accepted:
         return None
     return (f"refusing to start: the router did not accept a multi-form request ({detail}). "
