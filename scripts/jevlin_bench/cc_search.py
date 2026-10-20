@@ -14,7 +14,8 @@ searches per turn — a wrapper sees a sequence of calls, not turn boundaries.
 
 Environment set by the generated script:
   CC_ROOT          the fork's root (for .env and the company_research package)
-  CC_ARM           vendor key (a harness vendor or a Jevlin arm)
+  CC_ARM           vendor key (a harness vendor or a Jevlin arm); a forms arm gets the job's previous
+                   query as `search_queries` (see previous_query)
   CC_HOP_DIR       where hop files go (search-01.json, search-02.json, ...)
   CC_MAX_SEARCHES  total budget (14, the harness's AgentConfig.max_searches)
   CC_MAX_RESULTS   hits shown per search (10, the harness's AgentConfig.max_results)
@@ -33,6 +34,7 @@ from pathlib import Path
 ROOT = Path(os.environ.get("CC_ROOT") or Path(__file__).resolve().parents[2])
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import jevlin_core.jevlin as core  # noqa: E402
 from company_research import jevlin_vendor, vendors  # noqa: E402
 from company_research.vendors import VendorCall  # noqa: E402
 
@@ -58,10 +60,37 @@ def emit(payload: dict) -> None:
     sys.stdout.flush()
 
 
-def run_search(arm: str, query: str, max_results: int) -> VendorCall:
+def previous_query(hop_dir: Path) -> str | None:
+    """The query of the job's most recent hop that can be read; None before the first search."""
+    for path in reversed(hop_files(hop_dir)):
+        try:
+            query = str(json.loads(path.read_text()).get("query") or "").strip()
+        except (OSError, ValueError, AttributeError):
+            continue
+        if query:
+            return query
+    return None
+
+
+def forms_for(arm: str, query: str, hop_dir: Path) -> list[str]:
+    """The forms a search carries: for a forms arm, the previous query of this job when it differs
+    from the current one (case-insensitively). Exactly one, not the history: the experiment is
+    whether the reformulation chain's last link helps. The first search of a job carries none, so it
+    is byte-identical to the twin arm's and shares its gateway cache key."""
+    if not core.is_forms_arm(arm):
+        return []
+    previous = previous_query(hop_dir)
+    if previous is None or previous.casefold() == query.casefold():
+        return []
+    return [previous]
+
+
+def run_search(arm: str, query: str, max_results: int, search_queries: list[str] | None = None) -> VendorCall:
     if arm == jevlin_vendor.FIXTURE_VENDOR_KEY:
         payload = json.loads(Path(os.environ["CC_FIXTURE_PATH"]).read_text())
         return jevlin_vendor.fixture_call(payload, query, max_results=max_results)
+    if search_queries:
+        return jevlin_vendor.search_call(arm, query, max_results=max_results, search_queries=search_queries)
     kwargs: dict = {"max_results": max_results}
     if arm == "perplexity":
         kwargs["search_context_size"] = "low"  # search-only board (agent.py: low without fetch)
@@ -87,10 +116,11 @@ def main(argv: list[str]) -> int:
         emit(BUDGET_EXHAUSTED)
         return 0
     load_environment()
+    search_queries = forms_for(arm, query, hop_dir)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     started = time.perf_counter()
     try:
-        call = run_search(arm, query, max_results)
+        call = run_search(arm, query, max_results, search_queries)
     except Exception as exc:  # noqa: BLE001 — any failure is a recorded, shown error hop, never a crash
         call = VendorCall(status="error", latency_ms=round((time.perf_counter() - started) * 1000),
                           raw_request={"vendor": arm, "query": query}, raw_response=None,
@@ -102,6 +132,7 @@ def main(argv: list[str]) -> int:
         "seq": seq,
         "query": query,
         "vendor": arm,
+        "search_queries": search_queries,
         "started_at": started_at,
         "wall_ms": wall_ms,
         "call": asdict(call),

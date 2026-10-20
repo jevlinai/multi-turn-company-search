@@ -14,6 +14,9 @@ PY="${PYTHON:-}"
 [ -z "$PY" ] && { [ -x .venv/bin/python ] && PY=.venv/bin/python || PY=python3; }
 
 : "${DATASET:=datasets/company-research/ob-company-websearch-v1-converted.json}"
+# jevlin_balanced_forms is the forms experiment (the previous query rides along as a second form);
+# it runs only beside jevlin_balanced in the same pass, so it stays out of the default ARMS:
+# : "${ARMS:=perplexity,exa_instant,parallel_fast,jevlin_fast,jevlin_balanced,jevlin_balanced_forms,jevlin_single,jevlin_fanout_raw,jevlin_fanout_merged,jevlin_cli}"
 : "${ARMS:=perplexity,exa_instant,parallel_fast,jevlin_fast,jevlin_balanced,jevlin_single,jevlin_fanout_raw,jevlin_fanout_merged,jevlin_cli}"
 : "${MODEL:=claude-sonnet-5-5}"
 : "${PASSES:=3}"

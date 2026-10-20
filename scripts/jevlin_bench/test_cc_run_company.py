@@ -21,6 +21,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -28,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(HERE))
 
 import cc_run_company as cc  # noqa: E402
+import forms_preflight  # noqa: E402
 from company_research.dataset import build_artifact, load_artifact  # noqa: E402
 from company_research.judge import build_leaderboard, load_artifacts  # noqa: E402
 
@@ -438,6 +441,21 @@ class JobOrder(unittest.TestCase):
             self.assertEqual(cc.cache_key_class(arm), "balanced")
         self.assertEqual(cc.cache_key_class("exa_instant"), "direct:exa_instant")
 
+    def test_forms_arm_shares_the_balanced_key_class_with_its_twin(self):
+        # Its first search of a job sends no forms, so it is byte-identical to jevlin_balanced's and
+        # hits the same gateway cache key: the cache-gap wait between the two blocks must apply.
+        self.assertEqual(cc.cache_key_class("jevlin_balanced_forms"), "balanced")
+        self.assertEqual(cc.cache_key_class("jevlin_balanced_forms"), cc.cache_key_class("jevlin_balanced"))
+
+    def test_forms_arm_is_spread_with_the_other_balanced_tier_arms(self):
+        arms = ["jevlin_balanced", "jevlin_balanced_forms", "exa_instant", "perplexity"]
+        for trial in (1, 2, 3):
+            blocks = cc.block_order(arms, trial)
+            self.assertEqual(sorted(blocks), sorted(arms))
+            at = [i for i, a in enumerate(blocks) if cc.cache_key_class(a) == "balanced"]
+            self.assertEqual(len(at), 2)
+            self.assertGreaterEqual(at[1] - at[0], 2, blocks)
+
     def test_key_class_order_runs_arm_blocks_with_balanced_tier_arms_apart(self):
         jobs, blocks = cc.plan_jobs(self.CASES, self.ARMS, seed=1, trial_index=1, order="key-class")
         self.assertEqual(len(jobs), 36)
@@ -463,6 +481,57 @@ class JobOrder(unittest.TestCase):
         import random
         random.Random(7).shuffle(expected)
         self.assertEqual(jobs, expected)
+
+
+class FormsPreflight(unittest.TestCase):
+    def test_only_a_forms_arm_needs_the_probe(self):
+        def fail():
+            raise AssertionError("probe must not run")
+        self.assertIsNone(forms_preflight.require_forms_router(["jevlin_balanced", "exa_instant"], probe_fn=fail))
+
+    def test_accepting_router_passes_and_a_refusing_one_blocks_naming_the_pr_and_the_cost(self):
+        arms = ["jevlin_balanced", "jevlin_balanced_forms"]
+        self.assertIsNone(forms_preflight.require_forms_router(arms, probe_fn=lambda: (True, "accepted")))
+        message = forms_preflight.require_forms_router(arms, probe_fn=lambda: (False, "HTTP 400: malformed_json"))
+        self.assertIn("PR #55", message)
+        self.assertIn("malformed_json", message)
+        self.assertIn("$0.04", message)
+
+    def test_probe_accepts_only_a_200_with_coverage_by_form(self):
+        def call(status, payload, error=None):
+            return SimpleNamespace(status=status, raw_response=payload, error=error)
+        cases = [
+            (call("ok", {"coverage": {"by_form": []}}), True),
+            (call("ok", {"merged": []}), False),
+            (call("error", {"error": "malformed_json"}, "HTTP 400: malformed_json"), False),
+        ]
+        for response, accepted in cases:
+            with unittest_env({"JEVLIN_API_KEY": "k"}), mock.patch("company_research.vendors._request", return_value=response) as req, \
+                    mock.patch("dotenv.load_dotenv"):
+                self.assertEqual(forms_preflight.probe()[0], accepted)
+            body = req.call_args.kwargs["body"]
+            self.assertEqual((body["tier"], body["view"], body["max_results"]), ("balanced", "merged", 1))
+            self.assertEqual(len(body["search_queries"]), 1)
+            self.assertEqual(req.call_args.kwargs["retries"], 0)
+
+    def test_driver_refuses_to_start_a_forms_pass_against_a_router_without_forms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp) / "dataset.json"
+            dataset.write_text(json.dumps(build_artifact({"method": "t", "items": [{
+                "id": "q-1", "question": "Which companies were founded after 2020?", "family": "other",
+                "constraint_count": 1, "clauses": ["founded after 2020"], "answers": ["Acme"]}]},
+                dataset_slug="t", dataset_name="T")))
+            argv = ["--dataset", str(dataset), "--arms", "jevlin_balanced,jevlin_balanced_forms", "--out-dir", str(Path(tmp) / "out"),
+                    "--claude-bin", "/nonexistent/claude"]
+            out = io.StringIO()
+            with mock.patch.object(forms_preflight, "probe", return_value=(False, "HTTP 400: malformed_json")), \
+                    mock.patch.object(cc, "run_job", side_effect=AssertionError("no session may start")), contextlib.redirect_stdout(out):
+                self.assertEqual(cc.main(argv), 2)
+            self.assertIn("PR #55", out.getvalue())
+            self.assertFalse((Path(tmp) / "out" / "cc-pass-1.json").exists())
+            # plan-only never probes (no spend)
+            with mock.patch.object(forms_preflight, "probe", side_effect=AssertionError("no probe")), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cc.main([*argv, "--plan-only"]), 0)
 
 
 class ResumeRule(unittest.TestCase):

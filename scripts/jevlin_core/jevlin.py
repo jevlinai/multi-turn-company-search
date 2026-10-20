@@ -17,11 +17,19 @@ invocation of the public `jevlin` CLI.
 |------------------------|-------------------------------------------|----------------------------------------------------|
 | jevlin_fast            | tier=fast, tenant's default providers     | Jevlin's merged order, top N                       |
 | jevlin_balanced        | tier=balanced, default providers          | merged order, top N                                |
+| jevlin_balanced_forms  | tier=balanced, default providers, plus    | merged order across all forms, top N               |
+|                        | search_queries=[the job's previous query] |                                                    |
 | jevlin_max             | tier=max, default providers               | merged order, top N (carried; not a company arm)   |
 | jevlin_single          | providers=[JEVLIN_SINGLE_PROVIDER]        | that provider's own order, top N                   |
 | jevlin_fanout_raw      | tier=balanced, providers=JEVLIN_PROVIDERS | round-robin over providers, exact-URL dedup, top N |
 | jevlin_fanout_merged   | tier=balanced, providers=JEVLIN_PROVIDERS | merged order, top N                                |
 | jevlin_cli             | `jevlin search --stdin`, no tier, no view | the CLI's own client-side merge, top N             |
+
+`jevlin_balanced_forms` is the twin of `jevlin_balanced` that differs only in the forms it sends: the
+caller supplies the agent's previous query and the router runs it beside the current one in the same
+call, returning one merged list. It measures whether carrying the reformulation chain helps; with no
+form to send (a job's first search) its request is byte-identical to `jevlin_balanced`'s. It needs a
+router that accepts `search_queries` (Jevlin-core PR #55).
 
 `jevlin_fanout_*` refuse to run without `JEVLIN_PROVIDERS`: the ablation must pin the set so a
 configuration change on the server cannot move it between passes. The tier arms deliberately do
@@ -116,6 +124,7 @@ class Arm:
     presentation: str  # "merged" | "raw"
     pin_providers: bool = False
     single_provider: bool = False
+    forms: bool = False  # sends the caller's `search_queries` beside `query`
 
     def providers(self) -> list[str]:
         if self.single_provider:
@@ -131,6 +140,9 @@ class Arm:
 HTTP_ARMS: dict[str, Arm] = {
     "jevlin_fast": Arm("jevlin_fast", "fast", "merged"),
     "jevlin_balanced": Arm("jevlin_balanced", "balanced", "merged"),
+    # The balanced twin that carries the previous query as a second form. Unpinned, like
+    # jevlin_balanced: it measures what a customer gets.
+    "jevlin_balanced_forms": Arm("jevlin_balanced_forms", "balanced", "merged", forms=True),
     "jevlin_max": Arm("jevlin_max", "max", "merged"),
     # One provider through Jevlin: the plumbing without the fan-out. Compared with the same
     # provider's direct runner this isolates what the gateway adds or costs on its own:
@@ -142,8 +154,38 @@ HTTP_ARMS: dict[str, Arm] = {
 CLI_ARM = "jevlin_cli"
 
 
-def request_body(arm_name: str, query: str, max_results: int) -> dict[str, Any]:
-    """The HTTP request for an arm. Raises RuntimeError when a fan-out arm is unpinned."""
+MAX_FORMS = 4  # the router's cap on `search_queries`
+
+
+def is_forms_arm(arm_name: str) -> bool:
+    arm = HTTP_ARMS.get(arm_name)
+    return bool(arm and arm.forms)
+
+
+def clean_forms(query: str, search_queries: Any) -> list[str]:
+    """The forms worth sending: not the query itself (case-insensitively), no duplicates, at most four.
+
+    The router drops those too; they are dropped here so the hop record shows what was meaningfully sent.
+    """
+    seen = {query.strip().casefold()}
+    out: list[str] = []
+    for form in search_queries or ():
+        text = str(form).strip()
+        if not text or text.casefold() in seen:
+            continue
+        seen.add(text.casefold())
+        out.append(text)
+        if len(out) >= MAX_FORMS:
+            break
+    return out
+
+
+def request_body(arm_name: str, query: str, max_results: int, *, search_queries: Any = ()) -> dict[str, Any]:
+    """The HTTP request for an arm. Raises RuntimeError when a fan-out arm is unpinned.
+
+    `search_queries` is sent only by a forms arm and only when something is left after cleaning, so
+    every other arm's body, and a forms arm's first search of a job, are unchanged.
+    """
     arm = HTTP_ARMS[arm_name]
     # view:"merged" adds `merged` and `indexes` and changes nothing else in the response, so every
     # arm asks for it and the raw presentation reads `candidates` from the same body.
@@ -153,6 +195,9 @@ def request_body(arm_name: str, query: str, max_results: int) -> dict[str, Any]:
     providers = arm.providers()
     if providers:
         body["providers"] = providers
+    forms = clean_forms(query, search_queries) if arm.forms else []
+    if forms:
+        body["search_queries"] = forms
     return body
 
 
@@ -255,11 +300,12 @@ def arm_summary(payload: Any) -> list[dict[str, Any]]:
     return arms
 
 
-def jevlin_meta(payload: Any, hits: list[dict[str, Any]], *, presentation: str) -> dict[str, Any]:
+def jevlin_meta(payload: Any, hits: list[dict[str, Any]], *, presentation: str, forms_sent: Any = ()) -> dict[str, Any]:
     decision = (payload or {}).get("decision") or {}
     usage = (payload or {}).get("usage") or {}
     arms = arm_summary(payload)
     merged = (payload or {}).get("merged")
+    coverage = (payload or {}).get("coverage")
     return {
         "jevlin_request_id": str((payload or {}).get("request_id") or ""),
         "jevlin_presentation": presentation,
@@ -283,6 +329,12 @@ def jevlin_meta(payload: Any, hits: list[dict[str, Any]], *, presentation: str) 
         "jevlin_arms": arms,
         "jevlin_merged_total": len(merged) if isinstance(merged, list) else None,
         "jevlin_hits_shown": len(hits),
+        # What the forms arm sent (empty for every other arm and for a job's first search), the
+        # router's own cut of the merged list, and its per-form coverage (`by_form`,
+        # `reformulation_only`) when it answered a multi-form request.
+        "jevlin_forms_sent": list(forms_sent or ()),
+        "jevlin_merged_limit": (payload or {}).get("merged_limit"),
+        "jevlin_coverage": coverage if isinstance(coverage, dict) else None,
     }
 
 
@@ -441,11 +493,12 @@ def cli_meta(envelope: dict[str, Any], hits: list[dict[str, Any]]) -> dict[str, 
     }
 
 
-# The six arms the shared conventions name for every suite; jevlin_max is carried in the table
-# for comparability but is not a company arm.
+# The six arms the shared conventions name for every suite, plus the forms experiment;
+# jevlin_max is carried in the table for comparability but is not a company arm.
 COMPANY_ARMS: tuple[str, ...] = (
     "jevlin_fast",
     "jevlin_balanced",
+    "jevlin_balanced_forms",
     "jevlin_single",
     "jevlin_fanout_raw",
     "jevlin_fanout_merged",

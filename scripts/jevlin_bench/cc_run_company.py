@@ -55,6 +55,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import forms_preflight  # noqa: E402
 from company_research import jevlin_vendor  # noqa: E402
 from company_research.agent import COMPANY_SET_SCHEMA, OUTPUT_SCHEMA_VERSION, PARSER_VERSION, AgentConfig  # noqa: E402
 from company_research.dataset import load_artifact  # noqa: E402
@@ -713,6 +714,13 @@ def main(argv: list[str] | None = None) -> int:
             "required_env_for_the_wrapper": env_needed, "out_dir": str(args.out_dir), "summary": str(args.summary),
         }, indent=2))
         return 0
+
+    # A forms arm on a router without multi-form support would run without its forms: probe once
+    # (one balanced search) before any session starts.
+    refusal = forms_preflight.require_forms_router(arms)
+    if refusal:
+        print(refusal, flush=True)
+        return 2
 
     version = claude_version(args.claude_bin)
     resumed_rows, done_keys, dropped = load_resume_rows(args.resume_from)

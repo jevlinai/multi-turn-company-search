@@ -55,8 +55,8 @@ def _completed(stdout: str, *, code: int = 0, stderr: str = "") -> subprocess.Co
 
 
 class Registration(unittest.TestCase):
-    def test_the_six_company_arms_are_registered_search_only(self):
-        self.assertEqual(core.COMPANY_ARMS, ("jevlin_fast", "jevlin_balanced", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"))
+    def test_the_company_arms_are_registered_search_only(self):
+        self.assertEqual(core.COMPANY_ARMS, ("jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"))
         for name in core.COMPANY_ARMS:
             with self.subTest(arm=name):
                 spec = VENDORS[name]
@@ -359,6 +359,58 @@ class FixturePath(unittest.TestCase):
         self.assertEqual(call.metadata["jevlin_request_id"], "req_fixture_0001")
         self.assertEqual(call.raw_response, MERGED)
         self.assertEqual(jevlin_vendor.FIXTURE_SPEC.public_dict()["key"], "jevlin_fixture")
+
+
+class FormsArm(unittest.TestCase):
+    def _body(self, arm: str, **kw):
+        with _env():
+            return core.request_body(arm, QUERY, 10, **kw)
+
+    def test_forms_arm_is_the_balanced_twin_with_forms(self):
+        twin, forms = core.HTTP_ARMS["jevlin_balanced"], core.HTTP_ARMS["jevlin_balanced_forms"]
+        self.assertTrue(forms.forms)
+        self.assertFalse(twin.forms)
+        self.assertEqual((forms.tier, forms.presentation, forms.pin_providers), (twin.tier, twin.presentation, twin.pin_providers))
+        self.assertEqual(VENDORS["jevlin_balanced_forms"].request_config["forms"], "previous query of this job")
+        self.assertTrue(core.is_forms_arm("jevlin_balanced_forms"))
+        self.assertFalse(core.is_forms_arm("jevlin_balanced"))
+        self.assertFalse(core.is_forms_arm("perplexity"))
+
+    def test_request_body_sends_forms_only_for_a_forms_arm(self):
+        body = self._body("jevlin_balanced_forms", search_queries=["Colorado Insight Partners portfolio"])
+        self.assertEqual(body["search_queries"], ["Colorado Insight Partners portfolio"])
+        self.assertEqual({k: v for k, v in body.items() if k != "search_queries"}, self._body("jevlin_balanced"))
+        for arm in ("jevlin_balanced", "jevlin_fast", "jevlin_single"):
+            self.assertNotIn("search_queries", self._body(arm, search_queries=["x"]), arm)
+
+    def test_request_body_drops_the_query_itself_and_duplicates_and_caps_at_four(self):
+        body = self._body("jevlin_balanced_forms", search_queries=[QUERY.upper(), "a", "A", " b ", "c", "d", "e"])
+        self.assertEqual(body["search_queries"], ["a", "b", "c", "d"])
+        self.assertNotIn("search_queries", self._body("jevlin_balanced_forms", search_queries=[QUERY.upper(), QUERY]))
+
+    def test_request_body_without_forms_is_byte_identical_to_the_twin(self):
+        for kw in ({}, {"search_queries": []}, {"search_queries": ()}):
+            self.assertEqual(self._body("jevlin_balanced_forms", **kw), self._body("jevlin_balanced"))
+
+    def test_meta_records_forms_sent_and_coverage(self):
+        payload = {**MERGED, "merged_limit": 10, "coverage": {"by_form": [{"form": QUERY, "results": 5}, {"form": "x", "results": 4}], "reformulation_only": 2}}
+        meta = core.jevlin_meta(payload, [], presentation="merged", forms_sent=["x"])
+        self.assertEqual(meta["jevlin_forms_sent"], ["x"])
+        self.assertEqual(meta["jevlin_coverage"]["reformulation_only"], 2)
+        self.assertEqual(meta["jevlin_merged_limit"], 10)
+        self.assertEqual(meta["jevlin_merged_total"], len(MERGED["merged"]))
+        plain = core.jevlin_meta(MERGED, [], presentation="merged")
+        self.assertEqual((plain["jevlin_forms_sent"], plain["jevlin_coverage"], plain["jevlin_merged_limit"]), ([], None, None))
+
+    def test_search_call_passes_the_forms_through_and_records_what_was_sent(self):
+        with _env(), patch("company_research.jevlin_vendor._request", return_value=_ok(MERGED)) as req:
+            call = jevlin_vendor.search_call("jevlin_balanced_forms", QUERY, max_results=10, search_queries=["x", QUERY])
+        self.assertEqual(req.call_args.kwargs["body"]["search_queries"], ["x"])
+        self.assertEqual(call.metadata["jevlin_forms_sent"], ["x"])
+        with _env(), patch("company_research.jevlin_vendor._request", return_value=_ok(MERGED)) as req:
+            call = jevlin_vendor.search_call("jevlin_balanced_forms", QUERY, max_results=10)
+        self.assertNotIn("search_queries", req.call_args.kwargs["body"])
+        self.assertEqual(call.metadata["jevlin_forms_sent"], [])
 
 
 if __name__ == "__main__":

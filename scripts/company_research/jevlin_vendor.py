@@ -65,7 +65,7 @@ def _host_hits(core_hits: list[dict[str, str]]) -> list[dict[str, Any]]:
     return [_hit(h["url"], h["title"], h["snippet"]) for h in core_hits]
 
 
-def finish_http_call(presentation: str, call: VendorCall, max_results: int) -> JevlinCall:
+def finish_http_call(presentation: str, call: VendorCall, max_results: int, *, forms_sent: Any = ()) -> JevlinCall:
     """Turn a completed `_request` into the Jevlin VendorCall: hits, observed cost, telemetry."""
     payload = call.raw_response if isinstance(call.raw_response, dict) else {}
     hits: list[dict[str, Any]] = []
@@ -73,7 +73,7 @@ def finish_http_call(presentation: str, call: VendorCall, max_results: int) -> J
     cost: float | None = 0.0
     if call.status == "ok":
         hits = _host_hits(core.PRESENTATIONS[presentation](payload, max_results=max_results, snippet_chars=SNIPPET_CHARS))
-        metadata = core.jevlin_meta(payload, hits, presentation=presentation)
+        metadata = core.jevlin_meta(payload, hits, presentation=presentation, forms_sent=forms_sent)
         cost = cost_usd_from_micros(payload.get("usage"))
     return JevlinCall(
         status=call.status, latency_ms=call.latency_ms, raw_request=call.raw_request,
@@ -82,18 +82,18 @@ def finish_http_call(presentation: str, call: VendorCall, max_results: int) -> J
     )
 
 
-def http_call(vendor_key: str, query: str, *, max_results: int) -> JevlinCall:
+def http_call(vendor_key: str, query: str, *, max_results: int, search_queries: Any = ()) -> JevlinCall:
     arm = core.HTTP_ARMS[vendor_key]
     # Refused before any request: a missing key or an unpinned fan-out arm raises here, as the
     # harness's other vendors raise on a missing credential.
-    body = core.request_body(vendor_key, query, max_results)
+    body = core.request_body(vendor_key, query, max_results, search_queries=search_queries)
     key = core.api_key()
     call = _request(
         method="POST", url=core.api_url(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         body=body, timeout=int(core.timeout_s()),
     )
-    return finish_http_call(arm.presentation, call, max_results)
+    return finish_http_call(arm.presentation, call, max_results, forms_sent=body.get("search_queries") or ())
 
 
 def cli_call(query: str, *, max_results: int) -> JevlinCall:
@@ -138,11 +138,11 @@ def fixture_call(payload: dict[str, Any], query: str, *, max_results: int) -> Je
     return out
 
 
-def search_call(vendor_key: str, query: str, *, max_results: int = 10) -> JevlinCall:
+def search_call(vendor_key: str, query: str, *, max_results: int = 10, search_queries: Any = ()) -> JevlinCall:
     """`vendors.search()` for a Jevlin arm. Returns a complete VendorCall (hits and cost set)."""
     if vendor_key == core.CLI_ARM:
         return cli_call(query, max_results=max_results)
-    return http_call(vendor_key, query, max_results=max_results)
+    return http_call(vendor_key, query, max_results=max_results, search_queries=search_queries)
 
 
 def parse_hits(vendor_key: str, payload: Any, max_results: int) -> list[dict[str, Any]]:
