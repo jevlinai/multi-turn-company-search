@@ -82,6 +82,10 @@ class Registration(unittest.TestCase):
 
     def test_vendored_core_names_its_source_commit(self):
         self.assertEqual(core.SOURCE_COMMIT, "f01b032")
+        # The divergence from the base is pinned: a re-vendor has to carry or retire it.
+        self.assertEqual(core.LOCAL_CHANGES, (
+            "forms: Arm.forms, clean_forms, request_body(search_queries=...), jevlin_meta forms_sent/merged_limit/coverage",
+        ))
         self.assertIn("f01b032", core.__doc__)
         self.assertIn("web-search-for-coding-agents", core.__doc__)
 

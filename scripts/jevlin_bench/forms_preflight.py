@@ -3,7 +3,8 @@
 A router without Jevlin-core PR #55 answers a request carrying `search_queries` with
 `400 malformed_json`. Without this check a rollback, or a run pointed at another host, would execute
 `jevlin_balanced_forms` and either fail every second search or, worse, be read as a result. The
-probe is one balanced search with one form and `max_results` 1: about $0.04 of gateway spend. It is
+probe is one balanced search with one form and `max_results` 1; the router bills each extra form as a
+query, so it costs about $0.08 of gateway spend. It is
 accepted only on a 200 whose body carries `coverage.by_form`, the router's own evidence that it ran
 the forms; a 200 without it is a router that ignored the field.
 
@@ -26,7 +27,7 @@ import jevlin_core.jevlin as core  # noqa: E402
 
 PROBE_QUERY = "companies backed by Insight Partners founded in Colorado"
 PROBE_FORM = "Colorado startups with Insight Partners as an investor"
-PROBE_COST_USD = 0.04
+PROBE_COST_USD = 0.08
 PR = "Jevlin-core PR #55 (multi-form `search_queries`)"
 
 
@@ -69,7 +70,7 @@ def require_forms_router(arms: list[str], probe_fn=probe) -> str | None:
         return None
     return (f"refusing to start: the router did not accept a multi-form request ({detail}). "
             f"The forms arm needs a router with {PR}; without it the arm would run without its forms. "
-            f"The probe is one balanced search (about ${PROBE_COST_USD:.2f}).")
+            f"The probe is one balanced query plus one form, billed as two queries (about ${PROBE_COST_USD:.2f}).")
 
 
 def main() -> int:

@@ -7,8 +7,8 @@ Reads the pass summaries written by cc_run_company.py (and, through each row's `
 searches' Jevlin metadata) and prints one line per arm. The five numbers that decide the forms
 experiment, `jevlin_balanced_forms` against `jevlin_balanced`, are:
 
-  F1 (the harness's own judge), searches per trial, observed cost per trial (`cost_usd` summed over
-  the trial's searches), hits shown per search, and from the metadata the mean
+  F1 (the harness's own judge), searches per trial, observed cost per trial (`cost_usd`, with its
+  `vendor_cost_usd` and `model_cost_usd` parts reported beside it), hits shown per search, and from the metadata the mean
   `coverage.reformulation_only` and the share of searches that carried a form.
 
 A trial that errored is counted with the F1 the judge gave it (zero) like any other row; the report
@@ -58,7 +58,11 @@ def arm_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "trials": len(rows),
         "f1": _mean([float(r["f1"]) for r in rows]),
         "searches_per_trial": _mean([float(r["search_count"]) for r in rows]),
+        # The sum hides which side moved: a forms arm doubles search spend and changes the
+        # reading load, so the vendor and model parts are reported beside it.
         "cost_usd_per_trial": _mean([float(r["cost_usd"]) for r in rows if r.get("cost_usd") is not None]),
+        "vendor_cost_usd_per_trial": _mean([float(r["vendor_cost_usd"]) for r in rows if r.get("vendor_cost_usd") is not None]),
+        "model_cost_usd_per_trial": _mean([float(r["model_cost_usd"]) for r in rows if r.get("model_cost_usd") is not None]),
         "hits_shown_per_search": _mean([float(n) for n in shown]),
         "mean_reformulation_only": _mean(reformulation_only),
         "share_searches_with_form": round(len(with_form) / len(searches), 4) if searches else None,

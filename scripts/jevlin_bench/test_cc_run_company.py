@@ -495,7 +495,7 @@ class FormsPreflight(unittest.TestCase):
         message = forms_preflight.require_forms_router(arms, probe_fn=lambda: (False, "HTTP 400: malformed_json"))
         self.assertIn("PR #55", message)
         self.assertIn("malformed_json", message)
-        self.assertIn("$0.04", message)
+        self.assertIn("$0.08", message)
 
     def test_probe_accepts_only_a_200_with_coverage_by_form(self):
         def call(status, payload, error=None):

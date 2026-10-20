@@ -40,6 +40,13 @@ per arm); pinned-provider handling; `present_merged`; `present_raw`; `arm_summar
 the CLI argv (`search -config <bench> --stdin -no-flush`), environment, stdin request, envelope
 reading, client-merge presentation and inferred `no_usable_result`.
 
+Local extension, not in the coding-agents fork: the forms arm (`Arm.forms`, `clean_forms`,
+`request_body(search_queries=...)`, and `forms_sent` / `merged_limit` / `coverage` in `jevlin_meta`) was
+added here for the B3-only forms experiment. It is additive: every other arm's request body is
+unchanged, and a forms arm with nothing to send is byte-identical to `jevlin_balanced`. Because it
+did not land in the coding-agents fork first, `SOURCE_COMMIT` stays the base and `LOCAL_CHANGES`
+records the divergence; a re-vendor has to carry it or retire it.
+
 Changed, and why:
   1. The snippet cap is a parameter. The coding harness cuts snippets at 1,200 characters; the
      company harness cuts at 4,000 (`company_research.vendors._hit`). The conventions bind each
@@ -74,6 +81,9 @@ from dataclasses import dataclass
 from typing import Any
 
 SOURCE_COMMIT = "f01b032"
+LOCAL_CHANGES = (
+    "forms: Arm.forms, clean_forms, request_body(search_queries=...), jevlin_meta forms_sent/merged_limit/coverage",
+)
 DEFAULT_API_URL = "https://api.jevlin.ai"
 SEARCH_PATH = "/v1/search"
 DEFAULT_TIMEOUT_S = 45.0
