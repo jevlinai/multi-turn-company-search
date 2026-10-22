@@ -186,7 +186,7 @@ class RunnerTest(unittest.TestCase):
                 "parallel_fast", "parallel_turbo", "seltz_companies", "serp",
                 "tavily_advanced", "tavily_basic", "you_highlights", "you_highlights_core", "tinyfish", "perplexity",
                 # benchmark fork: Jevlin arms, search-only (no fetch path by design)
-                "jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli",
+                "jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_balanced_split", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli",
             },
         )
         capabilities = {row["vendor"]: row for row in capability_inventory()}
@@ -237,7 +237,7 @@ class RunnerTest(unittest.TestCase):
         merged = {"merged": [{"url": "https://a.test", "title": "A", "excerpt": "one"}]}
         raw = {"candidates": [{"provider": "exa", "status": "ok", "citations": [{"url": "https://a.test", "title": "A", "snippet": "one"}]}]}
         fixtures.update({
-            "jevlin_fast": merged, "jevlin_balanced": merged, "jevlin_balanced_forms": merged, "jevlin_fanout_merged": merged,
+            "jevlin_fast": merged, "jevlin_balanced": merged, "jevlin_balanced_forms": merged, "jevlin_balanced_split": merged, "jevlin_fanout_merged": merged,
             "jevlin_single": raw, "jevlin_fanout_raw": raw,
             "jevlin_cli": {"ok": True, "result": {"merged": [{"url": "https://a.test", "title": "A", "snippet": "one"}]}},
         })

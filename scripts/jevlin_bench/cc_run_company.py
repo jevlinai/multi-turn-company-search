@@ -31,6 +31,11 @@ a run of failed searches counted per backend family (all Jevlin arms together). 
 keeps the rows of an interrupted pass that were judged on something and re-runs the rest.
 Trials run one at a time (concurrency 1): the harness's default of three concurrent trials would
 let Jevlin's 15-minute cache answer trials 2 and 3 of a question for free.
+
+One arm departs from the hit cut above on purpose: `jevlin_balanced_split` shows the router's whole
+merged list (up to 40 entries, the compact tail as one line each) instead of the first 10, an
+internal-adaptation deviation from the upstream top-N rule that every split job records in its notes
+(`core.SPLIT_DEVIATION`). A pass that includes it first probes the router for `excerpt_mode`.
 """
 
 from __future__ import annotations
@@ -56,6 +61,8 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import forms_preflight  # noqa: E402
+import jevlin_core.jevlin as core  # noqa: E402
+import split_preflight  # noqa: E402
 from company_research import jevlin_vendor  # noqa: E402
 from company_research.agent import COMPANY_SET_SCHEMA, OUTPUT_SCHEMA_VERSION, PARSER_VERSION, AgentConfig  # noqa: E402
 from company_research.dataset import load_artifact  # noqa: E402
@@ -404,6 +411,8 @@ def run_job(case: dict[str, Any], arm: str, trial_index: int, *, args, dataset: 
         notes.append("search budget exhausted")
     if not hops:
         notes.append("no search was made")
+    if core.is_split_arm(arm):
+        notes.append(core.SPLIT_DEVIATION)
     denials = result.get("permission_denials") if isinstance(result.get("permission_denials"), list) else []
     for denial in denials[:10]:
         notes.append(f"tool denied: {json.dumps(denial, default=str)[:160]}")
@@ -586,7 +595,10 @@ def select_cases(dataset: dict[str, Any], *, case_keys: list[str], offset: int, 
 
 # Gateway cache key classes. The cache is keyed by query + tier + provider set + filters, so every
 # arm that asks for tier balanced with the account's (pinned) provider set — jevlin_balanced, both
-# fan-out arms and the CLI's default config — shares one key class; `fast` and `single` are their own;
+# fan-out arms, the split arm and the CLI's default config — shares one key class (the split arm
+# is spaced like the rest because it is not known whether `excerpt_mode` is part of the router's cache
+# key; if it is not, a split search answered from a plain balanced one would show no compact tail,
+# which the report's share of searches with a compact entry exposes); `fast` and `single` are their own;
 # direct vendors have no shared cache. The smoke on 2026-10-16 saw 7 of 112 searches answered from
 # cache between balanced-tier arms of the same question (the agent wrote the same first query), so a
 # pass can be ordered by key class with a TTL wait before every new balanced-tier block.
@@ -718,6 +730,12 @@ def main(argv: list[str] | None = None) -> int:
     # A forms arm on a router without multi-form support would run without its forms: probe once
     # (one balanced search) before any session starts.
     refusal = forms_preflight.require_forms_router(arms)
+    if refusal:
+        print(refusal, flush=True)
+        return 2
+    # Likewise the split arm: a router that does not know `excerpt_mode` refuses every request of it.
+    # The probe is a request the router refuses before any provider is called.
+    refusal = split_preflight.require_split_router(arms)
     if refusal:
         print(refusal, flush=True)
         return 2

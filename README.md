@@ -19,7 +19,7 @@ deterministic offline scorer. It does not require a hosted database: the runner
 reads one frozen dataset JSON file and writes one immutable JSON artifact per
 trial under `runs/`.
 
-The Jevlin arms vendor `scripts/jevlin_core/jevlin.py` from the coding-agents fork at `f01b032`, with one local extension (the forms arm, `LOCAL_CHANGES` in that file) that is not in the fork.
+The Jevlin arms vendor `scripts/jevlin_core/jevlin.py` from the coding-agents fork at `f01b032`, with two local extensions (the forms arm and the split-view arm, `LOCAL_CHANGES` in that file) that are not in the fork at that commit.
 
 ## Why not BrowseComp
 

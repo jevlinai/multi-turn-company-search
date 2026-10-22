@@ -17,6 +17,9 @@ PY="${PYTHON:-}"
 # jevlin_balanced_forms is the forms experiment (the previous query rides along as a second form);
 # it runs only beside jevlin_balanced in the same pass, so it stays out of the default ARMS:
 # : "${ARMS:=perplexity,exa_instant,parallel_fast,jevlin_fast,jevlin_balanced,jevlin_balanced_forms,jevlin_single,jevlin_fanout_raw,jevlin_fanout_merged,jevlin_cli}"
+# jevlin_balanced_split is the excerpt_mode:"split" test (the model reads the router's whole merged list,
+# not the top 10); it also runs only beside jevlin_balanced, stays out of the default ARMS, and the driver
+# refuses to start until a free probe shows the router knows excerpt_mode (scripts/jevlin_bench/split_preflight.py).
 : "${ARMS:=perplexity,exa_instant,parallel_fast,jevlin_fast,jevlin_balanced,jevlin_single,jevlin_fanout_raw,jevlin_fanout_merged,jevlin_cli}"
 : "${MODEL:=claude-sonnet-5-5}"
 : "${PASSES:=3}"

@@ -4,9 +4,10 @@
 The driver (cc_run_company.py) writes a tiny shell script per job that sets CC_* and execs this
 file with the harness's Python. The session sees only this command's stdout, which is exactly the
 tool output the harness's own agent loop shows the model (`agent.py`):
-{"vendor", "query", "hits": [{url, title, snippet, metadata}], "error"}. Every call is recorded as
-a hop file carrying the whole `VendorCall` (redacted request, raw response, attempts, cost,
-telemetry), which the driver turns into the artifact's `result.searches[]`.
+{"vendor", "query", "hits": [{url, title, snippet, metadata}], "error"}, except that the split arm's
+`hits` is its whole merged list with the compact tail as one-line strings (see shown_hits). Every
+call is recorded as a hop file carrying the whole `VendorCall` (redacted request, raw response,
+attempts, cost, telemetry), which the driver turns into the artifact's `result.searches[]`.
 
 Budgets enforced here, because a wrapper can enforce them: the total search budget (the (N+1)th
 call answers "search budget exhausted; answer now", the harness's words). Not enforceable here:
@@ -18,7 +19,9 @@ Environment set by the generated script:
                    query as `search_queries` (see previous_query)
   CC_HOP_DIR       where hop files go (search-01.json, search-02.json, ...)
   CC_MAX_SEARCHES  total budget (14, the harness's AgentConfig.max_searches)
-  CC_MAX_RESULTS   hits shown per search (10, the harness's AgentConfig.max_results)
+  CC_MAX_RESULTS   hits shown per search (10, the harness's AgentConfig.max_results); sent to the router
+                   as max_results by every arm, and the cut for every arm but jevlin_balanced_split,
+                   which shows the router's whole merged list
   CC_FIXTURE_PATH  tests and plumbing checks only: with CC_ARM=jevlin_fixture, serve this merged body
 """
 
@@ -127,7 +130,10 @@ def main(argv: list[str]) -> int:
                           error=f"{type(exc).__name__}: {exc}", attempts=[], cost_usd=0.0, hits=[])
     wall_ms = round((time.perf_counter() - started) * 1000)
     seq = done + 1
-    shown = {"vendor": arm, "query": query, "hits": call.hits or [], "error": call.error}
+    # What the model reads. For every arm but the split one this is call.hits unchanged; the split arm's
+    # compact entries become one line each (jevlin_core.jevlin.shown_hits), in the router's order. The
+    # hop keeps both: `call.hits` (objects, with the compact flag) and `shown` (as the model saw it).
+    shown = {"vendor": arm, "query": query, "hits": core.shown_hits(call.hits or []), "error": call.error}
     hop = {
         "seq": seq,
         "query": query,

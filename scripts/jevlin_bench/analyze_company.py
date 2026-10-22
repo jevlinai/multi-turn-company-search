@@ -11,6 +11,12 @@ experiment, `jevlin_balanced_forms` against `jevlin_balanced`, are:
   `vendor_cost_usd` and `model_cost_usd` parts reported beside it), hits shown per search, and from the metadata the mean
   `coverage.reformulation_only` and the share of searches that carried a form.
 
+For the split arm (`jevlin_balanced_split`) three more numbers say what the model read, from the
+search metadata: `compact_shown_per_search` (one-line entries), `chars_shown_per_search` (the length of
+the `hits` JSON the model received) and `share_searches_with_compact` (the validity signal: a split
+search whose answer held no compact entry was a short list or came from the cache of a plain search).
+They are null for every other arm.
+
 A trial that errored is counted with the F1 the judge gave it (zero) like any other row; the report
 does not drop rows, so both arms are held to the same rule.
 """
@@ -54,6 +60,8 @@ def arm_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(m.get("jevlin_coverage"), dict) and isinstance(m["jevlin_coverage"].get("reformulation_only"), (int, float))
     ]
     shown = [int(m["jevlin_hits_shown"]) for m in searches if m.get("jevlin_hits_shown") is not None]
+    compact = [int(m["jevlin_split_compact_shown"]) for m in searches if m.get("jevlin_split_compact_shown") is not None]
+    chars = [int(m["jevlin_split_chars_shown"]) for m in searches if m.get("jevlin_split_chars_shown") is not None]
     return {
         "trials": len(rows),
         "f1": _mean([float(r["f1"]) for r in rows]),
@@ -66,6 +74,9 @@ def arm_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "hits_shown_per_search": _mean([float(n) for n in shown]),
         "mean_reformulation_only": _mean(reformulation_only),
         "share_searches_with_form": round(len(with_form) / len(searches), 4) if searches else None,
+        "compact_shown_per_search": _mean([float(n) for n in compact]),
+        "chars_shown_per_search": _mean([float(n) for n in chars]),
+        "share_searches_with_compact": round(sum(1 for n in compact if n > 0) / len(compact), 4) if compact else None,
     }
 
 

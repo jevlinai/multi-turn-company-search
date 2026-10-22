@@ -31,6 +31,8 @@ sys.path.insert(0, str(HERE))
 
 import cc_run_company as cc  # noqa: E402
 import forms_preflight  # noqa: E402
+import jevlin_core.jevlin as core  # noqa: E402
+import split_preflight  # noqa: E402
 from company_research.dataset import build_artifact, load_artifact  # noqa: E402
 from company_research.judge import build_leaderboard, load_artifacts  # noqa: E402
 
@@ -536,6 +538,157 @@ class FormsPreflight(unittest.TestCase):
             with no_network, mock.patch.object(forms_preflight, "probe", side_effect=AssertionError("no probe")), \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cc.main([*argv, "--plan-only"]), 0)
+
+
+def no_network() -> contextlib.ExitStack:
+    """Any request fails loudly: a past test reached the router and made a real, billed call."""
+    stack = contextlib.ExitStack()
+    refusal = AssertionError("the test suite must not reach the network")
+    for target in ("company_research.vendors._request", "company_research.jevlin_vendor._request", "requests.sessions.Session.request"):
+        stack.enter_context(mock.patch(target, side_effect=refusal))
+    return stack
+
+
+# What the router answers the probe with. Flat {"error", "code"}; the code is the discriminator.
+UNKNOWN_FIELD = {"error": 'json: unknown field "excerpt_mode"', "code": "malformed_json"}
+VALIDATED = {"error": "excerpt_mode split requires view merged and tier balanced or max", "code": "invalid_request"}
+
+
+class SplitPreflight(unittest.TestCase):
+    def setUp(self):
+        guard = no_network()
+        guard.__enter__()
+        self.addCleanup(guard.__exit__, None, None, None)
+
+    @staticmethod
+    def _answer(status_code, payload, *, status="error", error="HTTP 400"):
+        return SimpleNamespace(status=status, raw_response=payload, error=error, attempts=[{"attempt": 1, "status_code": status_code}] if status_code else [])
+
+    def test_only_a_split_arm_needs_the_probe(self):
+        def fail():
+            raise AssertionError("probe must not run")
+        self.assertIsNone(split_preflight.require_split_router(["jevlin_balanced", "jevlin_balanced_forms", "exa_instant"], probe_fn=fail))
+
+    def test_outcome_one_a_refusal_naming_the_field_is_a_router_that_knows_it(self):
+        accepted, detail = split_preflight.classify(400, VALIDATED)
+        self.assertTrue(accepted, detail)
+        # a nested error object is read the same way
+        self.assertTrue(split_preflight.classify(400, {"error": {"code": "invalid_request", "message": "Excerpt_Mode is not allowed on tier fast"}})[0])
+
+    def test_outcome_two_malformed_json_is_a_router_without_the_field(self):
+        accepted, detail = split_preflight.classify(400, UNKNOWN_FIELD)
+        self.assertFalse(accepted)
+        self.assertIn("malformed_json", detail)
+        self.assertIn("unknown field", detail)
+
+    def test_outcome_three_anything_that_is_not_a_readable_refusal_is_not_confirmation(self):
+        accepted, detail = split_preflight.classify(200, {"merged": [], "request_id": "r"})
+        self.assertFalse(accepted)
+        self.assertIn("ignored the field", detail)
+        self.assertIn("billed", detail)
+        for status, payload in (
+            (400, {"error": "query is required", "code": "invalid_request"}),  # a 400 that does not name excerpt_mode
+            (401, {"error": "bad key", "code": "unauthorized"}),
+            (403, {"error": "tier not allowed", "code": "forbidden"}),
+            (429, {"error": "slow down", "code": "rate_limited"}),
+            (500, "upstream exploded"),
+            (None, None),
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(split_preflight.classify(status, payload)[0])
+
+    def test_probe_sends_split_on_fast_once_and_reads_the_refusal(self):
+        cases = [
+            (self._answer(400, VALIDATED), True),
+            (self._answer(400, UNKNOWN_FIELD), False),
+            (self._answer(200, {"merged": []}, status="ok", error=None), False),
+            (self._answer(None, None, error="ConnectionError: refused"), False),
+        ]
+        for response, accepted in cases:
+            with self.subTest(accepted=accepted), unittest_env({"JEVLIN_API_KEY": "k", "JEVLIN_API_URL": "https://jevlin.test"}), \
+                    mock.patch("company_research.vendors._request", return_value=response) as request, mock.patch("dotenv.load_dotenv"):
+                self.assertEqual(split_preflight.probe()[0], accepted)
+            kwargs = request.call_args.kwargs
+            self.assertEqual(kwargs["body"], {"query": split_preflight.PROBE_QUERY, "tier": "fast", "view": "merged", "max_results": 1, "excerpt_mode": "split"})
+            self.assertEqual((kwargs["retries"], kwargs["url"]), (0, "https://jevlin.test/v1/search"))
+            self.assertEqual(request.call_count, 1)
+
+    def test_probe_without_a_key_makes_no_request(self):
+        with unittest_env({"JEVLIN_API_KEY": ""}), mock.patch("dotenv.load_dotenv"):
+            accepted, detail = split_preflight.probe()  # the guard would raise if it tried
+        self.assertFalse(accepted)
+        self.assertIn("JEVLIN_API_KEY", detail)
+
+    def test_the_arm_is_refused_unless_the_probe_confirms(self):
+        arms = ["jevlin_balanced", "jevlin_balanced_split"]
+        self.assertIsNone(split_preflight.require_split_router(arms, probe_fn=lambda: (True, "accepted")))
+        message = split_preflight.require_split_router(arms, probe_fn=lambda: (False, "400 malformed_json: unknown field"))
+        self.assertIn("excerpt_mode", message)
+        self.assertIn("malformed_json", message)
+        self.assertIn("before any provider is called", message)
+
+    def test_driver_refuses_to_start_a_split_pass_against_a_router_without_the_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp) / "dataset.json"
+            dataset.write_text(json.dumps(build_artifact({"method": "t", "items": [{
+                "id": "q-1", "question": "Which companies were founded after 2020?", "family": "other",
+                "constraint_count": 1, "clauses": ["founded after 2020"], "answers": ["Acme"]}]},
+                dataset_slug="t", dataset_name="T")))
+            argv = ["--dataset", str(dataset), "--arms", "jevlin_balanced,jevlin_balanced_split", "--out-dir", str(Path(tmp) / "out"),
+                    "--claude-bin", "/nonexistent/claude"]
+            out = io.StringIO()
+            with mock.patch.object(split_preflight, "probe", return_value=(False, "400 malformed_json")), \
+                    mock.patch.object(cc, "run_job", side_effect=AssertionError("no session may start")), contextlib.redirect_stdout(out):
+                self.assertEqual(cc.main(argv), 2)
+            self.assertIn("excerpt_mode", out.getvalue())
+            self.assertFalse((Path(tmp) / "out" / "cc-pass-1.json").exists())
+            # plan-only never probes (it makes no request at all)
+            with mock.patch.object(split_preflight, "probe", side_effect=AssertionError("no probe")), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cc.main([*argv, "--plan-only"]), 0)
+            # a router that confirms lets the first session start
+            class Started(Exception):
+                pass
+            with mock.patch.object(split_preflight, "probe", return_value=(True, "accepted")), \
+                    mock.patch.object(cc, "claude_version", return_value="9.9.9"), \
+                    mock.patch.object(cc, "run_job", side_effect=Started), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(Started):
+                    cc.main(argv)
+
+    def _job_notes(self, arm: str) -> tuple[list[str], dict]:
+        """One real job through the driver with the Claude Code session faked: no search is made, no router is called."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = Path(tmp) / "dataset.json"
+            dataset.write_text(json.dumps(build_artifact({"method": "t", "items": [{
+                "id": "q-1", "question": "Which companies were founded after 2020?", "family": "other",
+                "constraint_count": 1, "clauses": ["founded after 2020"], "answers": ["Acme"]}]},
+                dataset_slug="t", dataset_name="T")))
+            session = {"type": "result", "subtype": "success", "is_error": False, "result": json.dumps({"companies": []}), "num_turns": 1,
+                       "usage": {"input_tokens": 1, "output_tokens": 1}}
+            fake = subprocess.CompletedProcess(["claude"], 0, stdout=json.dumps(session), stderr="")
+            argv = ["--dataset", str(dataset), "--arms", arm, "--out-dir", str(Path(tmp) / "out"), "--claude-bin", "/nonexistent/claude"]
+            with mock.patch.object(split_preflight, "probe", return_value=(True, "accepted")), \
+                    mock.patch.object(forms_preflight, "probe", return_value=(True, "accepted")), \
+                    mock.patch.object(cc.subprocess, "run", return_value=fake), contextlib.redirect_stdout(io.StringIO()):
+                cc.main(argv)
+            summary = json.loads((Path(tmp) / "out" / "cc-pass-1.json").read_text())
+            artifact = json.loads(Path(summary["rows"][0]["artifact"]).read_text())
+            return artifact["agent"]["notes"], artifact
+
+    def test_every_split_job_carries_the_deviation_label_and_no_other_arm_does(self):
+        notes, artifact = self._job_notes("jevlin_balanced_split")
+        self.assertIn(core.SPLIT_DEVIATION, notes)
+        self.assertIn("internal adaptation", core.SPLIT_DEVIATION)
+        self.assertIn("top-N", core.SPLIT_DEVIATION)
+        self.assertEqual(artifact["vendor"]["request_config"]["excerpt_mode"], "split")
+        notes, _ = self._job_notes("jevlin_balanced")
+        self.assertNotIn(core.SPLIT_DEVIATION, notes)
+
+    def test_the_split_arm_is_spaced_like_the_other_balanced_tier_arms(self):
+        self.assertEqual(cc.cache_key_class("jevlin_balanced_split"), "balanced")
+        arms = ["jevlin_balanced", "jevlin_balanced_split", "exa_instant", "perplexity"]
+        order = cc.block_order(arms, 1)
+        balanced = [i for i, a in enumerate(order) if a.startswith("jevlin")]
+        self.assertGreater(balanced[1] - balanced[0], 1, "an arm of another class sits between them")
 
 
 class ResumeRule(unittest.TestCase):

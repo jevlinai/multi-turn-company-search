@@ -8,7 +8,8 @@ host's shape — `{url, title, snippet[:4000], metadata}` — converts the gatew
 `usage.cost_micros` to the `cost_usd` the judge sums, and keeps the Jevlin telemetry on the call.
 
 What the model sees per hit is url / title / snippet with an empty `metadata`, as on the coding
-suite: the gateway's per-result `found_by` vote is deliberately not shown, so Jevlin's advantage can
+suite (the split arm is the one exception: it shows the whole merged list, and its compact tail as
+one line each; see `jevlin_core.jevlin.present_split`): the gateway's per-result `found_by` vote is deliberately not shown, so Jevlin's advantage can
 appear only through which pages it puts first and what their snippets say. The search-level
 telemetry (request id, tier, providers, cache hit, pending arms, per-arm statuses, upstream calls,
 merged total) is on `JevlinCall.metadata`, and the whole gateway body is `raw_response`, which the
@@ -61,8 +62,14 @@ def cost_usd_from_micros(usage: Any) -> float | None:
     return round(value / 1_000_000, 6) if value >= 0 else None
 
 
-def _host_hits(core_hits: list[dict[str, str]]) -> list[dict[str, Any]]:
-    return [_hit(h["url"], h["title"], h["snippet"]) for h in core_hits]
+def _host_hits(core_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for h in core_hits:
+        hit = _hit(h["url"], h["title"], h["snippet"])
+        if core.is_compact(h):
+            hit["compact"] = True  # split arm only; `core.shown_hits` turns it into one line for the model
+        out.append(hit)
+    return out
 
 
 def finish_http_call(presentation: str, call: VendorCall, max_results: int, *, forms_sent: Any = ()) -> JevlinCall:
@@ -73,7 +80,9 @@ def finish_http_call(presentation: str, call: VendorCall, max_results: int, *, f
     cost: float | None = 0.0
     if call.status == "ok":
         hits = _host_hits(core.PRESENTATIONS[presentation](payload, max_results=max_results, snippet_chars=SNIPPET_CHARS))
-        metadata = core.jevlin_meta(payload, hits, presentation=presentation, forms_sent=forms_sent)
+        # The split arm's reading load is measured on the host hits, the objects the model is shown.
+        split = core.split_stats(core.shown_hits(hits)) if presentation == "split" else None
+        metadata = core.jevlin_meta(payload, hits, presentation=presentation, forms_sent=forms_sent, split=split)
         cost = cost_usd_from_micros(payload.get("usage"))
     return JevlinCall(
         status=call.status, latency_ms=call.latency_ms, raw_request=call.raw_request,

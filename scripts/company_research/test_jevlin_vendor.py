@@ -5,6 +5,7 @@ Fixtures are the coding-agents fork's (f01b032), copied under testdata/jevlin/."
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -56,7 +57,7 @@ def _completed(stdout: str, *, code: int = 0, stderr: str = "") -> subprocess.Co
 
 class Registration(unittest.TestCase):
     def test_the_company_arms_are_registered_search_only(self):
-        self.assertEqual(core.COMPANY_ARMS, ("jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"))
+        self.assertEqual(core.COMPANY_ARMS, ("jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_balanced_split", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"))
         for name in core.COMPANY_ARMS:
             with self.subTest(arm=name):
                 spec = VENDORS[name]
@@ -85,6 +86,7 @@ class Registration(unittest.TestCase):
         # The divergence from the base is pinned: a re-vendor has to carry or retire it.
         self.assertEqual(core.LOCAL_CHANGES, (
             "forms: Arm.forms, clean_forms, request_body(search_queries=...), jevlin_meta forms_sent/merged_limit/coverage",
+            "split: Arm.excerpt_mode, request_body(excerpt_mode), present_split, compact_line/shown_hits/split_stats, jevlin_meta split stats",
         ))
         self.assertIn("f01b032", core.__doc__)
         self.assertIn("web-search-for-coding-agents", core.__doc__)
@@ -415,6 +417,149 @@ class FormsArm(unittest.TestCase):
             call = jevlin_vendor.search_call("jevlin_balanced_forms", QUERY, max_results=10)
         self.assertNotIn("search_queries", req.call_args.kwargs["body"])
         self.assertEqual(call.metadata["jevlin_forms_sent"], [])
+
+
+def no_network() -> contextlib.ExitStack:
+    """Make any request fail loudly. A past test reached the router and made a real, billed call.
+
+    `_request` is replaced under every name it is bound to (a test that wants an answer patches the
+    name it needs inside this guard), and `Session.request` is replaced underneath as a backstop for
+    a stale reference to `requests.request`.
+    """
+    stack = contextlib.ExitStack()
+    refusal = AssertionError("the test suite must not reach the network")
+    for target in ("company_research.vendors._request", "company_research.jevlin_vendor._request", "requests.sessions.Session.request"):
+        stack.enter_context(patch(target, side_effect=refusal))
+    return stack
+
+
+def split_payload(*, long: int = 10, compact: int = 30, **extra) -> dict:
+    """A synthetic split-view response: `long` entries with a long excerpt, then `compact` one-liners."""
+    merged = [{"url": f"https://long.test/{i}", "title": f"Long page {i}", "excerpt": f"Long excerpt {i}. " + "x" * 300}
+              for i in range(long)]
+    merged += [{"url": f"https://compact.test/{i}", "title": f"Compact page {i}", "excerpt": f"short text {i} " + "y" * 80, "compact": True}
+               for i in range(compact)]
+    return {**MERGED, "merged": merged, **extra}
+
+
+class SplitArm(unittest.TestCase):
+    def setUp(self):
+        guard = no_network()
+        guard.__enter__()
+        self.addCleanup(guard.__exit__, None, None, None)
+
+    def _search(self, arm: str, payload=None, *, max_results: int = 10, **env: str):
+        payload = split_payload() if payload is None else payload
+        with _env(**env), patch("company_research.jevlin_vendor._request", return_value=_ok(payload)) as req:
+            call = search(arm, QUERY, max_results=max_results)
+        self.assertEqual(req.call_count, 1)
+        return call, req.call_args.kwargs
+
+    def test_the_network_guard_refuses_a_request_the_test_did_not_stage(self):
+        with _env(), self.assertRaisesRegex(AssertionError, "must not reach the network"):
+            search("jevlin_balanced_split", QUERY)
+
+    def test_split_arm_is_the_balanced_twin_with_one_field(self):
+        twin, split = core.HTTP_ARMS["jevlin_balanced"], core.HTTP_ARMS["jevlin_balanced_split"]
+        self.assertEqual((split.tier, split.pin_providers, split.single_provider, split.forms),
+                         (twin.tier, twin.pin_providers, twin.single_provider, twin.forms))
+        self.assertEqual((split.excerpt_mode, twin.excerpt_mode, split.presentation), ("split", None, "split"))
+        self.assertTrue(core.is_split_arm("jevlin_balanced_split"))
+        for other in ("jevlin_balanced", "jevlin_balanced_forms", "jevlin_fast", "jevlin_cli", "perplexity"):
+            self.assertFalse(core.is_split_arm(other), other)
+        self.assertIn("jevlin_balanced_split", core.COMPANY_ARMS)
+        spec = VENDORS["jevlin_balanced_split"]
+        self.assertEqual((spec.request_config["excerpt_mode"], spec.request_config["tier"]), ("split", "balanced"))
+        self.assertIn("deviation", spec.request_config["shown"])
+
+    def test_request_is_the_balanced_body_plus_excerpt_mode_and_nothing_else(self):
+        _, split = self._search("jevlin_balanced_split")
+        _, balanced = self._search("jevlin_balanced")
+        self.assertEqual(split["body"], {**balanced["body"], "excerpt_mode": "split"})
+        self.assertEqual(split["body"], {"query": QUERY, "max_results": 10, "view": "merged", "tier": "balanced", "excerpt_mode": "split"})
+        self.assertEqual({k: v for k, v in split.items() if k != "body"}, {k: v for k, v in balanced.items() if k != "body"})
+
+    def test_no_other_arm_sends_excerpt_mode(self):
+        for arm in core.HTTP_ARMS:
+            if arm == "jevlin_balanced_split":
+                continue
+            with self.subTest(arm=arm), _env():
+                self.assertNotIn("excerpt_mode", core.request_body(arm, QUERY, 10, search_queries=["x"]))
+
+    def test_the_whole_merged_list_is_shown_in_router_order_with_no_cut(self):
+        payload = split_payload()
+        for max_results in (10, 3, 1):
+            with self.subTest(max_results=max_results):
+                call, _ = self._search("jevlin_balanced_split", payload, max_results=max_results)
+                self.assertEqual([h["url"] for h in call.hits], [m["url"] for m in payload["merged"]])
+                self.assertEqual(len(call.hits), 40)
+        long_hits, compact_hits = call.hits[:10], call.hits[10:]
+        for hit in long_hits:
+            self.assertEqual(set(hit), {"url", "title", "snippet", "metadata"})  # the host's hit format, unchanged
+        for hit in compact_hits:
+            self.assertEqual(set(hit), {"url", "title", "snippet", "metadata", "compact"})
+            self.assertIs(hit["compact"], True)
+        # the long entries are exactly what jevlin_balanced shows for the same pages
+        balanced, _ = self._search("jevlin_balanced", payload, max_results=10)
+        self.assertEqual(long_hits, balanced.hits)
+
+    def test_compact_entries_are_one_line_each_and_long_entries_stay_objects(self):
+        call, _ = self._search("jevlin_balanced_split")
+        shown = core.shown_hits(call.hits)
+        self.assertEqual(len(shown), 40)
+        self.assertEqual(shown[:10], call.hits[:10])
+        self.assertTrue(all(isinstance(item, dict) for item in shown[:10]))
+        self.assertTrue(all(isinstance(item, str) for item in shown[10:]))
+        self.assertTrue(all("\n" not in line for line in shown[10:]))
+        self.assertEqual(shown[10], "Compact page 0 | https://compact.test/0 | short text 0 " + "y" * 80)
+        self.assertEqual([line.split(" | ")[1] for line in shown[10:]], [f"https://compact.test/{i}" for i in range(30)])
+
+    def test_a_compact_line_collapses_whitespace_and_leaves_out_empty_parts(self):
+        hit = {"url": "https://a.test", "title": " A \n title ", "snippet": "two\nlines   and\ttabs", "compact": True}
+        self.assertEqual(core.compact_line(hit), "A title | https://a.test | two lines and tabs")
+        self.assertEqual(core.compact_line({"url": "https://a.test", "title": "", "snippet": "", "compact": True}), "https://a.test")
+        self.assertEqual(core.compact_line({"url": "https://a.test", "title": "T", "snippet": "", "compact": True}), "T | https://a.test")
+
+    def test_metadata_records_entries_shown_compact_and_characters(self):
+        call, _ = self._search("jevlin_balanced_split")
+        meta = call.metadata
+        shown = core.shown_hits(call.hits)
+        self.assertEqual(meta["jevlin_split_entries_shown"], 40)
+        self.assertEqual(meta["jevlin_split_compact_shown"], 30)
+        # characters of the `hits` JSON as the tool output serialises it
+        self.assertEqual(meta["jevlin_split_chars_shown"], len(json.dumps(shown, ensure_ascii=False)))
+        self.assertLess(meta["jevlin_split_chars_shown"], len(json.dumps(call.hits, ensure_ascii=False)),
+                        "one-line compact entries are shorter than the objects they replace")
+        self.assertEqual((meta["jevlin_hits_shown"], meta["jevlin_merged_total"], meta["jevlin_presentation"]), (40, 40, "split"))
+        self.assertEqual(asdict(call)["metadata"]["jevlin_split_compact_shown"], 30)
+
+    def test_entries_the_harness_cannot_show_are_visible_as_the_gap_to_merged_total(self):
+        payload = split_payload(long=2, compact=3)
+        payload["merged"] += [{"url": "https://long.test/0", "title": "dup"}, {"title": "no url"}, "not a dict"]
+        call, _ = self._search("jevlin_balanced_split", payload)
+        self.assertEqual(call.metadata["jevlin_merged_total"], 8)
+        self.assertEqual(call.metadata["jevlin_split_entries_shown"], 5)
+
+    def test_a_response_with_no_compact_entry_is_shown_as_it_came(self):
+        call, _ = self._search("jevlin_balanced_split", split_payload(long=8, compact=0))
+        self.assertEqual((call.metadata["jevlin_split_entries_shown"], call.metadata["jevlin_split_compact_shown"]), (8, 0))
+        self.assertEqual(core.shown_hits(call.hits), call.hits)
+
+    def test_other_arms_are_unchanged_by_the_split_work(self):
+        payload = split_payload()
+        for arm in ("jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_fanout_merged"):
+            with self.subTest(arm=arm):
+                call, _ = self._search(arm, payload, max_results=10)
+                self.assertEqual(len(call.hits), 10)  # still the upstream top-N cut
+                self.assertTrue(all("compact" not in hit for hit in call.hits))
+                self.assertEqual(core.shown_hits(call.hits), call.hits)
+                self.assertFalse([key for key in call.metadata if "split" in key])
+        raw_call, _ = self._search("jevlin_fanout_raw", payload, max_results=10)
+        self.assertTrue(all("compact" not in hit for hit in raw_call.hits))
+        self.assertEqual(core.PRESENTATIONS["merged"], core.present_merged)
+        self.assertEqual(sorted(core.PRESENTATIONS), ["merged", "raw", "split"])
+        # the merged presentation on a split payload still ignores the compact flag and cuts at N
+        self.assertEqual(len(core.present_merged(payload, max_results=8)), 8)
 
 
 if __name__ == "__main__":

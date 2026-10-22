@@ -19,6 +19,8 @@ invocation of the public `jevlin` CLI.
 | jevlin_balanced        | tier=balanced, default providers          | merged order, top N                                |
 | jevlin_balanced_forms  | tier=balanced, default providers, plus    | merged order across all forms, top N               |
 |                        | search_queries=[the job's previous query] |                                                    |
+| jevlin_balanced_split  | tier=balanced, default providers, plus    | the router's WHOLE merged list (up to 40): the     |
+|                        | excerpt_mode="split"                      | top 10 long, the rest one line each                |
 | jevlin_max             | tier=max, default providers               | merged order, top N (carried; not a company arm)   |
 | jevlin_single          | providers=[JEVLIN_SINGLE_PROVIDER]        | that provider's own order, top N                   |
 | jevlin_fanout_raw      | tier=balanced, providers=JEVLIN_PROVIDERS | round-robin over providers, exact-URL dedup, top N |
@@ -31,6 +33,16 @@ call, returning one merged list. It measures whether carrying the reformulation 
 form to send (a job's first search) its request is byte-identical to `jevlin_balanced`'s. It needs a
 router that accepts `search_queries` (Jevlin-core PR #55).
 
+`jevlin_balanced_split` is the twin of `jevlin_balanced` that differs only in one request field,
+`excerpt_mode:"split"` (valid with view merged and tier balanced or max), and in what the model is
+shown. In that mode the router's merged list holds up to 40 pages: the top 10 carry longer selected
+excerpts and the rest are compact entries (`compact: true`: a title, a URL, about 100 characters).
+INTERNAL-ADAPTATION DEVIATION from the upstream "top N" rule (every other arm cuts the list at N):
+this arm shows the whole list, because the compact tail is the thing under test and a top-N cut would
+hide it. The long entries keep the host's hit format; each compact entry is one line,
+"title | url | text". It needs a router that knows `excerpt_mode`; the driver probes for that first
+(`split_preflight.py`).
+
 `jevlin_fanout_*` refuse to run without `JEVLIN_PROVIDERS`: the ablation must pin the set so a
 configuration change on the server cannot move it between passes. The tier arms deliberately do
 not pin, because they measure what a customer gets.
@@ -40,12 +52,16 @@ per arm); pinned-provider handling; `present_merged`; `present_raw`; `arm_summar
 the CLI argv (`search -config <bench> --stdin -no-flush`), environment, stdin request, envelope
 reading, client-merge presentation and inferred `no_usable_result`.
 
-Local extension, not in the coding-agents fork: the forms arm (`Arm.forms`, `clean_forms`,
-`request_body(search_queries=...)`, and `forms_sent` / `merged_limit` / `coverage` in `jevlin_meta`) was
-added here for the B3-only forms experiment. It is additive: every other arm's request body is
-unchanged, and a forms arm with nothing to send is byte-identical to `jevlin_balanced`. Because it
-did not land in the coding-agents fork first, `SOURCE_COMMIT` stays the base and `LOCAL_CHANGES`
-records the divergence; a re-vendor has to carry it or retire it.
+Local extensions, not in the coding-agents fork at `SOURCE_COMMIT`: the forms arm (`Arm.forms`,
+`clean_forms`, `request_body(search_queries=...)`, and `forms_sent` / `merged_limit` / `coverage` in
+`jevlin_meta`) was added here for the B3-only forms experiment; the split arm (`Arm.excerpt_mode`,
+`request_body`, `present_split`, `compact_line` / `shown_hits` / `split_stats`, and the split keys of
+`jevlin_meta`) was added for the same-day excerpt_mode test and is mirrored on the fork's
+`feat/split-view-arm` branch (not yet on `jevlin-backend`). Both are additive: every other arm's request body, presentation and
+metadata are unchanged, a forms arm with nothing to send is byte-identical to `jevlin_balanced`, and a
+split request is `jevlin_balanced`'s plus one field. Because neither landed on the fork's
+`jevlin-backend` first, `SOURCE_COMMIT` stays the base and `LOCAL_CHANGES` records the divergence; a
+re-vendor has to carry it or retire it.
 
 Changed, and why:
   1. The snippet cap is a parameter. The coding harness cuts snippets at 1,200 characters; the
@@ -83,6 +99,7 @@ from typing import Any
 SOURCE_COMMIT = "f01b032"
 LOCAL_CHANGES = (
     "forms: Arm.forms, clean_forms, request_body(search_queries=...), jevlin_meta forms_sent/merged_limit/coverage",
+    "split: Arm.excerpt_mode, request_body(excerpt_mode), present_split, compact_line/shown_hits/split_stats, jevlin_meta split stats",
 )
 DEFAULT_API_URL = "https://api.jevlin.ai"
 SEARCH_PATH = "/v1/search"
@@ -92,6 +109,13 @@ DEFAULT_SNIPPET_CHARS = 1200
 # Statuses the gateway assigns an arm it never called. Everything else was an upstream request,
 # billed or not.
 NOT_CALLED = frozenset({"skipped"})
+# The one value of the request field `excerpt_mode` this module sends.
+EXCERPT_MODE_SPLIT = "split"
+# Stamped into the notes of every split-arm job, so the label travels with the data.
+SPLIT_DEVIATION = (
+    "deviation (internal adaptation): jevlin_balanced_split shows the model the router's whole merged "
+    "list, not the upstream top-N cut"
+)
 
 
 def api_url() -> str:
@@ -135,6 +159,7 @@ class Arm:
     pin_providers: bool = False
     single_provider: bool = False
     forms: bool = False  # sends the caller's `search_queries` beside `query`
+    excerpt_mode: str | None = None  # sends `excerpt_mode` (only "split" is used here)
 
     def providers(self) -> list[str]:
         if self.single_provider:
@@ -153,6 +178,9 @@ HTTP_ARMS: dict[str, Arm] = {
     # The balanced twin that carries the previous query as a second form. Unpinned, like
     # jevlin_balanced: it measures what a customer gets.
     "jevlin_balanced_forms": Arm("jevlin_balanced_forms", "balanced", "merged", forms=True),
+    # The balanced twin that asks the router for the split excerpt view and shows the whole list.
+    # Unpinned, like jevlin_balanced.
+    "jevlin_balanced_split": Arm("jevlin_balanced_split", "balanced", "split", excerpt_mode=EXCERPT_MODE_SPLIT),
     "jevlin_max": Arm("jevlin_max", "max", "merged"),
     # One provider through Jevlin: the plumbing without the fan-out. Compared with the same
     # provider's direct runner this isolates what the gateway adds or costs on its own:
@@ -170,6 +198,11 @@ MAX_FORMS = 4  # the router's cap on `search_queries`
 def is_forms_arm(arm_name: str) -> bool:
     arm = HTTP_ARMS.get(arm_name)
     return bool(arm and arm.forms)
+
+
+def is_split_arm(arm_name: str) -> bool:
+    arm = HTTP_ARMS.get(arm_name)
+    return bool(arm and arm.excerpt_mode == EXCERPT_MODE_SPLIT)
 
 
 def clean_forms(query: str, search_queries: Any) -> list[str]:
@@ -194,7 +227,8 @@ def request_body(arm_name: str, query: str, max_results: int, *, search_queries:
     """The HTTP request for an arm. Raises RuntimeError when a fan-out arm is unpinned.
 
     `search_queries` is sent only by a forms arm and only when something is left after cleaning, so
-    every other arm's body, and a forms arm's first search of a job, are unchanged.
+    every other arm's body, and a forms arm's first search of a job, are unchanged. `excerpt_mode` is
+    sent by the split arm on every search and by no other: its body is `jevlin_balanced`'s plus that field.
     """
     arm = HTTP_ARMS[arm_name]
     # view:"merged" adds `merged` and `indexes` and changes nothing else in the response, so every
@@ -208,6 +242,8 @@ def request_body(arm_name: str, query: str, max_results: int, *, search_queries:
     forms = clean_forms(query, search_queries) if arm.forms else []
     if forms:
         body["search_queries"] = forms
+    if arm.excerpt_mode:
+        body["excerpt_mode"] = arm.excerpt_mode
     return body
 
 
@@ -240,6 +276,40 @@ def present_merged(payload: Any, *, max_results: int, snippet_chars: int = DEFAU
         hits.append(_hit(url, page.get("title"), snippet, snippet_chars))
         if len(hits) >= max_results:
             break
+    return hits
+
+
+def present_split(payload: Any, *, max_results: int | None = None, snippet_chars: int = DEFAULT_SNIPPET_CHARS) -> list[dict[str, Any]]:
+    """The split view's `merged[]`: EVERY entry, in the router's order, with no top-N cut.
+
+    INTERNAL-ADAPTATION DEVIATION from the upstream rule that a harness shows the model the first N
+    hits (see `SPLIT_DEVIATION`). `max_results` is accepted so the presentations share a signature and
+    is deliberately unused: it is still sent to the router as its per-provider count, but it does not
+    cut what the model is shown.
+
+    Entries are read as `present_merged` reads them (same URL dedup, same excerpt choice, same
+    character cap), so the long entries (the top 10) are identical to what `jevlin_balanced` would
+    show for the same page. An entry the router marked `compact: true` additionally carries
+    `compact: True`; `shown_hits` turns those into one line each. Entries without a URL cannot be cited
+    and are skipped, which `jevlin_merged_total` against the entries shown makes visible.
+    """
+    del max_results
+    hits: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in (payload or {}).get("merged") or []:
+        if not isinstance(page, dict):
+            continue
+        url = str(page.get("url") or "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        snippet = page.get("excerpt") or "\n".join(
+            part for part in (page.get("excerpts") or []) if isinstance(part, str)
+        )
+        hit: dict[str, Any] = _hit(url, page.get("title"), snippet, snippet_chars)
+        if page.get("compact") is True:
+            hit["compact"] = True
+        hits.append(hit)
     return hits
 
 
@@ -277,7 +347,46 @@ def present_raw(payload: Any, *, max_results: int, snippet_chars: int = DEFAULT_
     return hits
 
 
-PRESENTATIONS = {"merged": present_merged, "raw": present_raw}
+PRESENTATIONS = {"merged": present_merged, "raw": present_raw, "split": present_split}
+
+
+# ── the split view as the model reads it ───────────────────────────────────
+
+
+def _one_line(text: Any) -> str:
+    return " ".join(str(text or "").split())
+
+
+def is_compact(hit: Any) -> bool:
+    return isinstance(hit, dict) and hit.get("compact") is True
+
+
+def compact_line(hit: dict[str, Any]) -> str:
+    """One line for a compact entry: title | url | the short text (empty parts left out)."""
+    parts = (_one_line(hit.get("title")), _one_line(hit.get("url")), _one_line(hit.get("snippet")))
+    return " | ".join(part for part in parts if part)
+
+
+def shown_hits(hits: list[dict[str, Any]]) -> list[Any]:
+    """The list the model reads: a long entry stays the host's hit object, a compact one becomes its line.
+
+    Router order is kept. A hit list with no compact entry (every other arm) comes back unchanged.
+    """
+    return [compact_line(hit) if is_compact(hit) else hit for hit in hits]
+
+
+def split_stats(shown: list[Any]) -> dict[str, int]:
+    """What one split search put in front of the model: entries, how many compact, characters.
+
+    `characters` is the length of the JSON the model receives for `hits` (long entries as objects,
+    compact ones as strings), serialised exactly as the tool output is, so it is a measure of the
+    reading load rather than of the router's payload.
+    """
+    return {
+        "jevlin_split_entries_shown": len(shown),
+        "jevlin_split_compact_shown": sum(1 for item in shown if isinstance(item, str)),
+        "jevlin_split_chars_shown": len(json.dumps(shown, ensure_ascii=False, default=str)),
+    }
 
 
 # ── metadata: what a harness's hop fields cannot carry ─────────────────────
@@ -310,13 +419,15 @@ def arm_summary(payload: Any) -> list[dict[str, Any]]:
     return arms
 
 
-def jevlin_meta(payload: Any, hits: list[dict[str, Any]], *, presentation: str, forms_sent: Any = ()) -> dict[str, Any]:
+def jevlin_meta(
+    payload: Any, hits: list[dict[str, Any]], *, presentation: str, forms_sent: Any = (), split: dict[str, int] | None = None,
+) -> dict[str, Any]:
     decision = (payload or {}).get("decision") or {}
     usage = (payload or {}).get("usage") or {}
     arms = arm_summary(payload)
     merged = (payload or {}).get("merged")
     coverage = (payload or {}).get("coverage")
-    return {
+    meta = {
         "jevlin_request_id": str((payload or {}).get("request_id") or ""),
         "jevlin_presentation": presentation,
         "jevlin_tier": decision.get("tier"),
@@ -346,6 +457,10 @@ def jevlin_meta(payload: Any, hits: list[dict[str, Any]], *, presentation: str, 
         "jevlin_merged_limit": (payload or {}).get("merged_limit"),
         "jevlin_coverage": coverage if isinstance(coverage, dict) else None,
     }
+    # The split arm's reading load (`split_stats`); absent for every other arm, so their metadata is unchanged.
+    if split:
+        meta.update(split)
+    return meta
 
 
 # ── the CLI arm: production Jevlin as an agent receives it ──────────────────
@@ -503,12 +618,13 @@ def cli_meta(envelope: dict[str, Any], hits: list[dict[str, Any]]) -> dict[str, 
     }
 
 
-# The six arms the shared conventions name for every suite, plus the forms experiment;
+# The six arms the shared conventions name for every suite, plus the forms and split experiments;
 # jevlin_max is carried in the table for comparability but is not a company arm.
 COMPANY_ARMS: tuple[str, ...] = (
     "jevlin_fast",
     "jevlin_balanced",
     "jevlin_balanced_forms",
+    "jevlin_balanced_split",
     "jevlin_single",
     "jevlin_fanout_raw",
     "jevlin_fanout_merged",
