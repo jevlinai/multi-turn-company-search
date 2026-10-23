@@ -57,7 +57,7 @@ def _completed(stdout: str, *, code: int = 0, stderr: str = "") -> subprocess.Co
 
 class Registration(unittest.TestCase):
     def test_the_company_arms_are_registered_search_only(self):
-        self.assertEqual(core.COMPANY_ARMS, ("jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_balanced_split", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"))
+        self.assertEqual(core.COMPANY_ARMS, ("jevlin_fast", "jevlin_balanced", "jevlin_balanced_forms", "jevlin_balanced_split", "jevlin_balanced_w16", "jevlin_balanced_w24", "jevlin_single", "jevlin_fanout_raw", "jevlin_fanout_merged", "jevlin_cli"))
         for name in core.COMPANY_ARMS:
             with self.subTest(arm=name):
                 spec = VENDORS[name]
@@ -564,3 +564,72 @@ class SplitArm(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def window_payload(pages: int = 30) -> dict:
+    """A merged response wide enough to show that a window arm shows all of its pages."""
+    return {
+        "request_id": "req_window",
+        "merged": [{"url": f"https://w{i}.test/p", "title": f"W{i}", "excerpt": f"page {i} text",
+                    "found_by": [{"provider": "exa", "rank": i + 1}], "best_rank": i + 1} for i in range(pages)],
+        "merged_total": 62, "merged_limit": pages,
+        "usage": {"cost_micros": 21000, "latency_ms": 1000},
+    }
+
+
+class WindowArms(unittest.TestCase):
+    """jevlin_balanced_w16 and _w24: the balanced body plus merged_limit, every page shown."""
+
+    def setUp(self):
+        guard = no_network()
+        guard.__enter__()
+        self.addCleanup(guard.__exit__, None, None, None)
+
+    def _search(self, arm: str, payload, *, max_results: int = 10):
+        with _env(), patch("company_research.jevlin_vendor._request", return_value=_ok(payload)) as req:
+            call = search(arm, QUERY, max_results=max_results)
+        self.assertEqual(req.call_count, 1)
+        return call, req.call_args.kwargs
+
+    def test_window_arms_are_balanced_twins_with_one_field(self):
+        twin = core.HTTP_ARMS["jevlin_balanced"]
+        for name, width in (("jevlin_balanced_w16", 16), ("jevlin_balanced_w24", 24)):
+            with self.subTest(arm=name):
+                arm = core.HTTP_ARMS[name]
+                self.assertEqual((arm.tier, arm.presentation, arm.pin_providers, arm.single_provider, arm.forms, arm.excerpt_mode),
+                                 (twin.tier, twin.presentation, twin.pin_providers, twin.single_provider, twin.forms, twin.excerpt_mode))
+                self.assertEqual((arm.merged_limit, arm.shown), (width, width))
+                self.assertEqual(core.shown_for(name, 10), width)
+                self.assertIn(name, core.COMPANY_ARMS)
+                self.assertEqual(VENDORS[name].request_config["merged_limit"], width)
+                self.assertIn("deviation", VENDORS[name].request_config["shown"])
+        self.assertEqual(core.shown_for("jevlin_balanced", 10), 10)
+        self.assertEqual(core.shown_for("jevlin_cli", 7), 7)
+
+    def test_request_is_the_balanced_body_plus_merged_limit(self):
+        _, balanced = self._search("jevlin_balanced", window_payload())
+        for name, width in (("jevlin_balanced_w16", 16), ("jevlin_balanced_w24", 24)):
+            with self.subTest(arm=name):
+                _, wide = self._search(name, window_payload())
+                self.assertEqual(wide["body"], {**balanced["body"], "merged_limit": width})
+                self.assertEqual({k: v for k, v in wide.items() if k != "body"}, {k: v for k, v in balanced.items() if k != "body"})
+
+    def test_no_other_arm_sends_merged_limit(self):
+        for arm in core.HTTP_ARMS:
+            if arm in ("jevlin_balanced_w16", "jevlin_balanced_w24"):
+                continue
+            with self.subTest(arm=arm), _env():
+                self.assertNotIn("merged_limit", core.request_body(arm, QUERY, 10, search_queries=["x"]))
+
+    def test_every_page_of_the_window_is_shown_whatever_the_harness_cut(self):
+        payload = window_payload(30)
+        for name, width in (("jevlin_balanced_w16", 16), ("jevlin_balanced_w24", 24)):
+            for max_results in (10, 3):
+                with self.subTest(arm=name, max_results=max_results):
+                    call, _ = self._search(name, payload, max_results=max_results)
+                    self.assertEqual(len(call.hits), width)
+                    self.assertEqual([h["url"] for h in call.hits], [m["url"] for m in payload["merged"][:width]])
+                    self.assertEqual(len(_parse_hits(name, payload, max_results)), width)
+        balanced, _ = self._search("jevlin_balanced", payload, max_results=10)
+        self.assertEqual(len(balanced.hits), 10)
+        self.assertEqual(call.hits[:10], balanced.hits)

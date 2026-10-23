@@ -102,7 +102,8 @@ def http_call(vendor_key: str, query: str, *, max_results: int, search_queries: 
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         body=body, timeout=int(core.timeout_s()),
     )
-    return finish_http_call(arm.presentation, call, max_results, forms_sent=body.get("search_queries") or ())
+    return finish_http_call(arm.presentation, call, core.shown_for(vendor_key, max_results),
+                            forms_sent=body.get("search_queries") or ())
 
 
 def cli_call(query: str, *, max_results: int) -> JevlinCall:
@@ -161,4 +162,5 @@ def parse_hits(vendor_key: str, payload: Any, max_results: int) -> list[dict[str
         envelope = payload.get("body") if isinstance(payload.get("body"), dict) else payload
         return _host_hits(core.present_cli(envelope, max_results=max_results, snippet_chars=SNIPPET_CHARS))
     presentation = "merged" if vendor_key == FIXTURE_VENDOR_KEY else core.HTTP_ARMS[vendor_key].presentation
-    return _host_hits(core.PRESENTATIONS[presentation](payload, max_results=max_results, snippet_chars=SNIPPET_CHARS))
+    shown = max_results if vendor_key == FIXTURE_VENDOR_KEY else core.shown_for(vendor_key, max_results)
+    return _host_hits(core.PRESENTATIONS[presentation](payload, max_results=shown, snippet_chars=SNIPPET_CHARS))

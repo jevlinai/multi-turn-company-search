@@ -21,6 +21,10 @@ invocation of the public `jevlin` CLI.
 |                        | search_queries=[the job's previous query] |                                                    |
 | jevlin_balanced_split  | tier=balanced, default providers, plus    | the router's WHOLE merged list (up to 40): the     |
 |                        | excerpt_mode="split"                      | top 10 long, the rest one line each                |
+| jevlin_balanced_w16    | tier=balanced, default providers, plus    | merged order, ALL 16 pages (deviation from top N)  |
+|                        | merged_limit=16                           |                                                    |
+| jevlin_balanced_w24    | tier=balanced, default providers, plus    | merged order, ALL 24 pages (deviation from top N)  |
+|                        | merged_limit=24                           |                                                    |
 | jevlin_max             | tier=max, default providers               | merged order, top N (carried; not a company arm)   |
 | jevlin_single          | providers=[JEVLIN_SINGLE_PROVIDER]        | that provider's own order, top N                   |
 | jevlin_fanout_raw      | tier=balanced, providers=JEVLIN_PROVIDERS | round-robin over providers, exact-URL dedup, top N |
@@ -160,6 +164,8 @@ class Arm:
     single_provider: bool = False
     forms: bool = False  # sends the caller's `search_queries` beside `query`
     excerpt_mode: str | None = None  # sends `excerpt_mode` (only "split" is used here)
+    merged_limit: int | None = None  # sends `merged_limit`: the router's merged window for this arm
+    shown: int | None = None  # hits shown to the model, in place of the harness's max_results cut
 
     def providers(self) -> list[str]:
         if self.single_provider:
@@ -181,6 +187,10 @@ HTTP_ARMS: dict[str, Arm] = {
     # The balanced twin that asks the router for the split excerpt view and shows the whole list.
     # Unpinned, like jevlin_balanced.
     "jevlin_balanced_split": Arm("jevlin_balanced_split", "balanced", "split", excerpt_mode=EXCERPT_MODE_SPLIT),
+    # The balanced twins that ask for a wider merged window and show all of it (the 2026-10-23 window
+    # experiment: today's text, more pages). Same request otherwise; the cache key ignores merged_limit.
+    "jevlin_balanced_w16": Arm("jevlin_balanced_w16", "balanced", "merged", merged_limit=16, shown=16),
+    "jevlin_balanced_w24": Arm("jevlin_balanced_w24", "balanced", "merged", merged_limit=24, shown=24),
     "jevlin_max": Arm("jevlin_max", "max", "merged"),
     # One provider through Jevlin: the plumbing without the fan-out. Compared with the same
     # provider's direct runner this isolates what the gateway adds or costs on its own:
@@ -244,7 +254,15 @@ def request_body(arm_name: str, query: str, max_results: int, *, search_queries:
         body["search_queries"] = forms
     if arm.excerpt_mode:
         body["excerpt_mode"] = arm.excerpt_mode
+    if arm.merged_limit:
+        body["merged_limit"] = int(arm.merged_limit)
     return body
+
+
+def shown_for(arm_name: str, max_results: int) -> int:
+    """How many hits the model is shown for an HTTP arm: the arm's own `shown`, else the harness cut."""
+    arm = HTTP_ARMS.get(arm_name)
+    return int(arm.shown) if arm and arm.shown else int(max_results)
 
 
 # ── presentation: Jevlin response → url / title / snippet hits ─────────────
@@ -625,6 +643,8 @@ COMPANY_ARMS: tuple[str, ...] = (
     "jevlin_balanced",
     "jevlin_balanced_forms",
     "jevlin_balanced_split",
+    "jevlin_balanced_w16",
+    "jevlin_balanced_w24",
     "jevlin_single",
     "jevlin_fanout_raw",
     "jevlin_fanout_merged",

@@ -44,6 +44,10 @@ from company_research.vendors import VendorCall  # noqa: E402
 BUDGET_EXHAUSTED = {"error": "search budget exhausted; answer now"}  # agent.py, verbatim
 DEFAULT_MAX_SEARCHES = 14
 DEFAULT_MAX_RESULTS = 10
+# A 429 from the router's per-minute limit under parallel streams is not a search result: wait and
+# ask again, up to this many times, before recording an error hop.
+RATE_LIMIT_TRIES = 15
+RATE_LIMIT_SLEEP_S = 8
 
 
 def load_environment() -> None:
@@ -124,6 +128,11 @@ def main(argv: list[str]) -> int:
     started = time.perf_counter()
     try:
         call = run_search(arm, query, max_results, search_queries)
+        tries = 0
+        while call.status != "ok" and "429" in str(call.error or "") and tries < RATE_LIMIT_TRIES:
+            tries += 1
+            time.sleep(RATE_LIMIT_SLEEP_S)
+            call = run_search(arm, query, max_results, search_queries)
     except Exception as exc:  # noqa: BLE001 — any failure is a recorded, shown error hop, never a crash
         call = VendorCall(status="error", latency_ms=round((time.perf_counter() - started) * 1000),
                           raw_request={"vendor": arm, "query": query}, raw_response=None,
